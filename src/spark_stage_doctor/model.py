@@ -219,6 +219,19 @@ class Executor:
 
 
 @dataclass
+class StreamQuery:
+    """One structured streaming query (by query id; a restart is a new runId of the same query)."""
+    id: str
+    name: str | None = None
+    progress: list[dict] = field(default_factory=list)    # StreamingQueryProgress JSON, in arrival order
+    exception: str | None = None
+
+    @property
+    def label(self) -> str:
+        return f"streaming query {self.name or self.id[:8]}"
+
+
+@dataclass
 class App:
     spark_version: str = ""
     name: str = ""
@@ -234,6 +247,7 @@ class App:
     profile_memory_mib: int | None = None          # default resource profile: executor heap (MiB)
     profile_overhead_mib: int | None = None
     pending_block_managers: dict[str, int] = field(default_factory=dict)   # block manager seen before its executor
+    streams: dict[str, StreamQuery] = field(default_factory=dict)
     unknown_events: Counter = field(default_factory=Counter)
     notes: list[str] = field(default_factory=list)
 
@@ -450,6 +464,18 @@ def build(events: list[dict]) -> App:
             app.profile_memory_mib = _int((req.get("memory") or {}).get("Amount"), None) if "memory" in req else None
             if "memoryOverhead" in req:
                 app.profile_overhead_mib = _int(req["memoryOverhead"].get("Amount"), None)
+        elif name == "QueryStartedEvent":
+            q = app.streams.setdefault(str(ev.get("id")), StreamQuery(str(ev.get("id"))))
+            q.name = ev.get("name") or q.name
+        elif name == "QueryProgressEvent":
+            prog = ev.get("progress") or {}
+            q = app.streams.setdefault(str(prog.get("id")), StreamQuery(str(prog.get("id"))))
+            q.name = prog.get("name") or q.name
+            q.progress.append(prog)
+        elif name == "QueryTerminatedEvent":
+            q = app.streams.get(str(ev.get("id")))
+            if q and ev.get("exception"):
+                q.exception = str(ev["exception"])
         elif name in _IGNORED:
             pass
         else:
@@ -470,8 +496,7 @@ _IGNORED = {"SparkListenerTaskStart", "SparkListenerTaskGettingResult",
             "SparkListenerNodeExcluded", "SparkListenerNodeUnexcluded", "SparkListenerExecutorBlacklisted",
             "SparkListenerExecutorUnblacklisted", "SparkListenerNodeBlacklisted", "SparkListenerNodeUnblacklisted",
             "SparkListenerExecutorExcludedForStage", "SparkListenerNodeExcludedForStage", "SparkListenerUnschedulableTaskSetAdded",
-            "SparkListenerUnschedulableTaskSetRemoved", "SparkListenerMiscellaneousProcessAdded", "QueryStartedEvent",
-            "QueryProgressEvent", "QueryTerminatedEvent", "QueryIdleEvent"}
+            "SparkListenerUnschedulableTaskSetRemoved", "SparkListenerMiscellaneousProcessAdded", "QueryIdleEvent"}
 
 
 def plan_json(node: PlanNode) -> dict:
@@ -479,5 +504,5 @@ def plan_json(node: PlanNode) -> dict:
     return {"name": node.raw_name, "children": [plan_json(c) for c in node.children]}
 
 
-__all__ = ["App", "Stage", "Task", "Job", "Executor", "SqlExecution", "PlanNode", "Metric", "build", "FAILED_REASONS",
+__all__ = ["App", "StreamQuery", "Stage", "Task", "Job", "Executor", "SqlExecution", "PlanNode", "Metric", "build", "FAILED_REASONS",
            "plan_json"]
