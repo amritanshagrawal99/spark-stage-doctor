@@ -30,12 +30,13 @@ class Thresholds:
     gc_min_run_ms: int = 60_000
     shuffle_heavy_min_bytes: int = GiB
     utilisation_min_app_ms: int = 5 * 60_000
+    small_files_min_count: int = 100
 
 
 DEFAULT = Thresholds()
 DEV = Thresholds(min_tasks=5, skew_min_max_task_ms=1000, data_skew_min_bytes=MiB, small_tasks_min_count=200,
                  few_tasks_min_wall_ms=1000, gc_min_run_ms=2000, shuffle_heavy_min_bytes=16 * MiB,
-                 utilisation_min_app_ms=5000)
+                 utilisation_min_app_ms=5000, small_files_min_count=50)
 PROFILES = {"default": DEFAULT, "dev": DEV}
 
 
@@ -532,6 +533,49 @@ def broadcast_candidates(app: App, th: Thresholds) -> list[Finding]:
     return out
 
 
+def small_files(app: App, th: Thresholds) -> list[Finding]:
+    """File scans over many small files, from the scan node's driver-side metrics (files and bytes read)."""
+    out = []
+    for ex in app.sql.values():
+        if ex.plan is None:
+            continue
+        for scan in ex.plan.walk():
+            files_m, size_m = scan.metric("number of files read"), scan.metric("size of files read")
+            if not (files_m and size_m) or not scan.name.startswith(("Scan", "FileScan", "BatchScan")):
+                continue
+            files = sum(app.sql_metric_values(ex.id, files_m.accumulator_id))
+            size = sum(app.sql_metric_values(ex.id, size_m.accumulator_id))
+            if files < th.small_files_min_count:
+                continue
+            avg = size / files
+            if avg >= 32 * MiB:
+                continue
+            open_cost = parse_bytes(app.conf("spark.sql.files.openCostInBytes", ex.id), 4 * MiB)
+            max_part = parse_bytes(app.conf("spark.sql.files.maxPartitionBytes", ex.id), 128 * MiB)
+            fmt = scan.metadata.get("Format") or scan.name.removeprefix("Scan ").strip()
+            location = scan.metadata.get("Location", "")
+            severity = "critical" if avg < MiB else "warn"
+            fixes = ["Compact the input into files of 128 MiB-1 GiB: Delta `OPTIMIZE`, Iceberg `rewrite_data_files`, "
+                     "or a one-off rewrite with fewer, larger files.",
+                     "Fix it where the files are produced: repartition (or `/*+ REBALANCE */`) before the write"
+                     + ("; on Databricks, delta.autoOptimize.optimizeWrite / autoCompact" if app.databricks else "")
+                     + "; for streaming sinks, a longer trigger interval."]
+            if avg < open_cost:
+                fixes.append(f"Meanwhile, each file costs Spark at least spark.sql.files.openCostInBytes "
+                             f"({spark_size(open_cost)}) when it packs splits, so tasks are padded with tiny files.")
+            out.append(Finding("small-files", severity, f"{fmt} scan read {files} small files (avg {human_bytes(avg)})",
+                               f"The scan read {files} files totalling {human_bytes(size)}, {human_bytes(avg)} on average. "
+                               "Every file costs a listing entry and an open (and a footer read for Parquet/ORC), so small files make "
+                               f"scans slow far beyond their size. Splits are packed up to {spark_size(max_part)} "
+                               "(spark.sql.files.maxPartitionBytes)."
+                               + (f" Location: {location[:120]}" if location else ""),
+                               fixes, {"files": files, "bytes": size, "avg_file_bytes": round(avg),
+                                       "open_cost_bytes": open_cost, "max_partition_bytes": max_part, "format": fmt},
+                               "project defaults (100 files, 32 MiB average); Spark file-split settings",
+                               sql_id=ex.id, where=f"SQL query {ex.id}" + (f": {ex.description[:80]}" if ex.description else "")))
+    return out
+
+
 def utilisation(app: App, th: Thresholds) -> list[Finding]:
     spans = sorted((j.submitted, j.completed) for j in app.jobs.values() if j.completed)
     if not spans or not app.total_cores:
@@ -566,6 +610,7 @@ def diagnose(app: App, th: Thresholds = DEFAULT) -> list[Finding]:
         for rule in STAGE_RULES:
             out += rule(app, s, th)
     out += broadcast_candidates(app, th)
+    out += small_files(app, th)
     out += utilisation(app, th)
     order = {k: i for i, k in enumerate(reversed(SEVERITIES))}
     return sorted(out, key=lambda f: (order[f.severity], f.stage or (1 << 30, 0), f.rule))

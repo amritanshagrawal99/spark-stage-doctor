@@ -61,6 +61,7 @@ Logs still being written are fine: a cut-off last line or compressed block is dr
 | `skew-join-not-split` | a shuffle join has a skewed partition that AQE did not split, and **which gate stopped it**: AQE off, skew join off, partition under `max(threshold, factor x median)`, a join type that can't be split, or AQE declining because splitting needs an extra shuffle | AQE's own `OptimizeSkewedJoin` rules |
 | `aqe-skew-split` | (info) AQE did split skewed partitions, with its counts | AQE |
 | `broadcast-candidate` | a sort-merge or shuffled-hash join whose small side (AQE's in-memory `data size`) fits the broadcast threshold, or is within 10x of it while the other side is 10x larger; knows which side each join type can broadcast | AQE threshold (10 MiB; 30 MiB adaptive on Databricks) |
+| `small-files` | a file scan read >= 100 files averaging under 32 MiB (from the scan's driver-side metrics); suggests compaction and where to fix the writer | project; Spark split settings |
 | `spill` | tasks spilled to disk; severity by spill relative to bytes read | Databricks (any spill); project share thresholds |
 | `too-many-small-tasks` | thousands of tasks with a sub-second median; advice depends on whether they came from a shuffle, a file scan, or the code | Spark tuning guide (200 ms) |
 | `too-few-tasks` | fewer tasks than cores on a long stage; points at `coalesce()` when it's in the lineage; skips small shuffles AQE coalesced on purpose | Databricks (one-task stage); tuning guide (2-3 tasks/core) |
@@ -116,7 +117,7 @@ These details decide whether the numbers are right. Each was checked against Spa
 `tools/gen_fixtures.py` runs on GitHub Actions with **pyspark 3.5.9 and 4.0.4**
 ([fixtures workflow](.github/workflows/fixtures.yml)). It writes one application per scenario: clean, plain-shuffle
 skew, a skewed join AQE doesn't split, one it does split, broadcast disabled, forced spill, 1000 tiny tasks, a
-`coalesce(1)` stage, injected task failures, and the clean app under every event-log codec and Spark's default
+`coalesce(1)` stage, injected task failures, 120 tiny CSV files, and the clean app under every event-log codec and Spark's default
 layout. The logs are committed, so the tests need no JVM.
 
 - **Every scenario must produce exactly its intended findings, and the clean baseline none,** on both Spark versions.
