@@ -565,7 +565,7 @@ def small_files(app: App, th: Thresholds) -> list[Finding]:
                              f"({spark_size(open_cost)}) when it packs splits, so tasks are padded with tiny files.")
             out.append(Finding("small-files", severity, f"{fmt} scan read {files} small files (avg {human_bytes(avg)})",
                                f"The scan read {files} files totalling {human_bytes(size)}, {human_bytes(avg)} on average. "
-                               "Every file costs a listing entry, an open and its own footer read, so small files make "
+                               "Every file costs a listing entry and an open (and a footer read for Parquet/ORC), so small files make "
                                f"scans slow far beyond their size. Splits are packed up to {spark_size(max_part)} "
                                "(spark.sql.files.maxPartitionBytes)."
                                + (f" Location: {location[:120]}" if location else ""),

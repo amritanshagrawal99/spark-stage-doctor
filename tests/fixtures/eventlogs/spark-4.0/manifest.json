@@ -163,6 +163,21 @@
     "seconds": 5.5,
     "spark_version": "4.0.4"
   },
+  "small_files": {
+    "app_id": "local-1792907283893",
+    "conf": {
+      "spark.eventLog.compress": "false",
+      "spark.eventLog.rolling.enabled": "false"
+    },
+    "expected": [
+      "small-files"
+    ],
+    "files": [
+      "local-1792907283893"
+    ],
+    "seconds": 1.0,
+    "spark_version": "4.0.4"
+  },
   "spill": {
     "app_id": "local-1792906468021",
     "conf": {

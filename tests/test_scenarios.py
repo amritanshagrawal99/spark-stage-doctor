@@ -25,6 +25,7 @@ EXPECTED = {
     "tiny_tasks": {"too-many-small-tasks"},
     "single_task": {"too-few-tasks"},
     "task_failures": {"task-failures"},
+    "small_files": {"small-files"},
 }
 
 
@@ -45,9 +46,9 @@ def test_scenario_produces_exactly_its_findings(version, scenario):
 @pytest.mark.parametrize("scenario", sorted(EXPECTED))
 def test_default_profile_is_quiet_on_tiny_jobs(version, scenario):
     """Production floors (30 s tasks, 100 MiB partitions, 2000 tasks...) must not fire on 1-second test jobs,
-    except where the evidence is not size-dependent (failed tasks, broadcast disabled for a tiny side, any spill)."""
+    except where the evidence is not size-dependent (failed tasks, broadcast disabled for a tiny side, any spill, 100+ tiny files)."""
     rules_hit = {f.rule for f in run(version, scenario, rules.DEFAULT).findings}
-    assert rules_hit <= {"task-failures", "broadcast-candidate", "spill", "aqe-skew-split"}, rules_hit
+    assert rules_hit <= {"task-failures", "broadcast-candidate", "spill", "aqe-skew-split", "small-files"}, rules_hit
 
 
 @pytest.mark.parametrize("version", VERSIONS)
@@ -139,3 +140,10 @@ def test_real_speculation_in_apache_log():
     d = analyse(FIX / "apache-spark" / "application_1628109047826_1317105.json")[0]
     f = next(f for f in d.findings if f.rule == "speculation-waste")
     assert f.evidence["killed_attempts"] == 1 and f.evidence["wasted_run_ms"] > 50_000
+
+
+@pytest.mark.parametrize("version", VERSIONS)
+def test_small_files_reads_the_scan_driver_metrics(version):
+    f = next(f for f in run(version, "small_files").findings if f.rule == "small-files")
+    assert f.evidence["files"] == 120 and f.evidence["format"] == "CSV" and f.evidence["avg_file_bytes"] < 4096
+    assert f.severity == "critical" and any("openCostInBytes (4m)" in x for x in f.fixes)
