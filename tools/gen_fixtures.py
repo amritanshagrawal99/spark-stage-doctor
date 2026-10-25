@@ -38,10 +38,11 @@ BASE_CONF = {
 
 
 def skewed_fact(spark, rows=2_000_000, hot_share=9):
-    """`hot_share` tenths of the rows have key 0; the rest spread over 1000 keys. ~70 bytes of payload per row."""
+    """`hot_share` tenths of the rows have key 0; the rest spread over 1000 keys. The payload is a SHA-256 hex
+    string: incompressible, so shuffle bytes reflect row counts (a repeated literal compresses to almost nothing)."""
     return (spark.range(0, rows)
             .withColumn("key", F.when(F.col("id") % 10 < hot_share, F.lit(0)).otherwise(F.col("id") % 1000))
-            .withColumn("payload", F.concat(F.lit("p" * 60), F.col("id").cast("string"))))
+            .withColumn("payload", F.sha2(F.col("id").cast("string"), 256)))
 
 
 def dim(spark, rows=1000):
@@ -107,7 +108,9 @@ def task_failures(spark):
 SCENARIOS = {
     "clean": ({}, clean, []),
     "skew_repartition": ({}, skew_repartition, ["task-skew"]),
-    "skew_join_unsplit": ({"spark.sql.adaptive.enabled": "true", "spark.sql.autoBroadcastJoinThreshold": "-1"},
+    # Coalescing off: otherwise AQE merges the 7 small partitions and the stage has 2 tasks, too few for a median.
+    "skew_join_unsplit": ({"spark.sql.adaptive.enabled": "true", "spark.sql.autoBroadcastJoinThreshold": "-1",
+                           "spark.sql.adaptive.coalescePartitions.enabled": "false"},
                           skew_join_unsplit, ["task-skew", "skew-join-not-split"]),
     "skew_join_split": ({"spark.sql.adaptive.enabled": "true", "spark.sql.autoBroadcastJoinThreshold": "-1",
                          "spark.sql.adaptive.skewJoin.skewedPartitionFactor": "2",
