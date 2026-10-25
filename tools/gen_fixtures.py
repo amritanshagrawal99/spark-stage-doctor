@@ -132,7 +132,8 @@ def executor_lost(spark):
 
 
 def executor_memory(spark):
-    """Cache ~200 MB and aggregate it, with executor metrics polled every 100 ms so the peaks are recorded."""
+    """Cache ~200 MB on 4 GiB executors and aggregate it, with executor metrics polled every 100 ms so the peaks are
+    recorded. Peak heap stays far below 4 GiB: an over-provisioning case."""
     df = (spark.range(0, 2_000_000, numPartitions=4)
           .withColumn("p", F.sha2(F.col("id").cast("string"), 256)).cache())
     df.count()
@@ -162,7 +163,7 @@ SCENARIOS = {
     "task_failures": ({"master": "local[2,2]"}, task_failures, ["task-failures"]),
     "small_files": ({}, small_files, ["small-files"]),
     "executor_lost": ({"master": CLUSTER}, executor_lost, ["task-failures"]),
-    "executor_memory": ({"master": CLUSTER, "spark.executor.metrics.pollingInterval": "100ms",
+    "executor_memory": ({"master": "local-cluster[2,1,4096]", "spark.executor.metrics.pollingInterval": "100ms",
                          "spark.executor.processTreeMetrics.enabled": "true"}, executor_memory, ["executor-memory"]),
 }
 
