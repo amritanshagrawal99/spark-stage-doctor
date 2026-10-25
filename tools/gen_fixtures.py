@@ -62,7 +62,8 @@ def clean(spark):
 
 def skew_repartition(spark):
     """Data skew in a plain shuffle: AQE cannot split it (it only splits joins)."""
-    noop(skewed_fact(spark).repartition(8, "key").sortWithinPartitions("payload"))
+    noop(skewed_fact(spark).repartition(8, "key").sortWithinPartitions("payload")
+         .withColumn("h", F.sha2(F.concat(F.col("payload"), F.col("payload")), 512)))   # per-row CPU work
 
 
 def skew_join_unsplit(spark):
