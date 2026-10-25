@@ -164,7 +164,8 @@ SCENARIOS = {
     "small_files": ({}, small_files, ["small-files"]),
     "executor_lost": ({"master": CLUSTER}, executor_lost, ["task-failures"]),
     # local-cluster's last number is the WORKER's memory; executors still default to spark.executor.memory=1g.
-    "executor_memory": ({"master": "local-cluster[2,1,4096]", "spark.executor.memory": "3g", "spark.executor.metrics.pollingInterval": "100ms",
+    "executor_memory": ({"master": "local-cluster[2,1,4096]", "spark.executor.memory": "3g",
+                         "spark.executor.metrics.pollingInterval": "100ms",
                          "spark.executor.processTreeMetrics.enabled": "true"}, executor_memory, ["executor-memory"]),
 }
 
