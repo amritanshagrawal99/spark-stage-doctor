@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "spark-stage-doctor"
+version = "0.1.0"
+description = "Offline Spark event-log doctor: per-stage diagnoses (skew, spill, tiny tasks, broadcast candidates, AQE gates) with evidence and config fixes."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Amritansh Agrawal" }]
+requires-python = ">=3.10"
+dependencies = ["zstandard>=0.22", "cramjam>=2.8"]
+keywords = ["spark", "pyspark", "event-log", "performance", "skew", "aqe", "databricks", "data-engineering"]
+classifiers = ["Programming Language :: Python :: 3", "License :: OSI Approved :: MIT License", "Topic :: Database"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[project.scripts]
+spark-stage-doctor = "spark_stage_doctor.cli:main"
+
+[project.urls]
+Repository = "https://github.com/amritanshagrawal99/spark-stage-doctor"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/spark_stage_doctor"]
+
+[tool.ruff]
+line-length = 140
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["tests/fixtures", ".github", "tools"]

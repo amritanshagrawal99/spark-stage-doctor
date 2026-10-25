@@ -1,0 +1,213 @@
+{
+  "broadcast_disabled": {
+    "app_id": "local-1792906442951",
+    "conf": {
+      "spark.eventLog.compress": "false",
+      "spark.eventLog.rolling.enabled": "false",
+      "spark.sql.autoBroadcastJoinThreshold": "-1"
+    },
+    "expected": [
+      "broadcast-candidate"
+    ],
+    "files": [
+      "local-1792906442951"
+    ],
+    "seconds": 1.0,
+    "spark_version": "3.5.9"
+  },
+  "clean": {
+    "app_id": "local-1792906425682",
+    "conf": {
+      "spark.eventLog.compress": "false",
+      "spark.eventLog.rolling.enabled": "false"
+    },
+    "expected": [],
+    "files": [
+      "local-1792906425682"
+    ],
+    "seconds": 4.9,
+    "spark_version": "3.5.9"
+  },
+  "clean-defaults": {
+    "app_id": "local-1792906455574",
+    "conf": {},
+    "expected": [],
+    "files": [
+      "local-1792906455574"
+    ],
+    "seconds": 0.5,
+    "spark_version": "3.5.9"
+  },
+  "clean-lz4": {
+    "app_id": "local-1792906453927",
+    "conf": {
+      "spark.eventLog.compress": "true",
+      "spark.eventLog.compression.codec": "lz4",
+      "spark.eventLog.rolling.enabled": "false"
+    },
+    "expected": [],
+    "files": [
+      "local-1792906453927.lz4"
+    ],
+    "seconds": 0.5,
+    "spark_version": "3.5.9"
+  },
+  "clean-lzf": {
+    "app_id": "local-1792906455033",
+    "conf": {
+      "spark.eventLog.compress": "true",
+      "spark.eventLog.compression.codec": "lzf",
+      "spark.eventLog.rolling.enabled": "false"
+    },
+    "expected": [],
+    "files": [
+      "local-1792906455033.lzf"
+    ],
+    "seconds": 0.5,
+    "spark_version": "3.5.9"
+  },
+  "clean-snappy": {
+    "app_id": "local-1792906454470",
+    "conf": {
+      "spark.eventLog.compress": "true",
+      "spark.eventLog.compression.codec": "snappy",
+      "spark.eventLog.rolling.enabled": "false"
+    },
+    "expected": [],
+    "files": [
+      "local-1792906454470.snappy"
+    ],
+    "seconds": 0.5,
+    "spark_version": "3.5.9"
+  },
+  "clean-zstd": {
+    "app_id": "local-1792906453367",
+    "conf": {
+      "spark.eventLog.compress": "true",
+      "spark.eventLog.compression.codec": "zstd",
+      "spark.eventLog.rolling.enabled": "false"
+    },
+    "expected": [],
+    "files": [
+      "local-1792906453367.zstd"
+    ],
+    "seconds": 0.5,
+    "spark_version": "3.5.9"
+  },
+  "single_task": {
+    "app_id": "local-1792906448097",
+    "conf": {
+      "spark.eventLog.compress": "false",
+      "spark.eventLog.rolling.enabled": "false"
+    },
+    "expected": [
+      "too-few-tasks"
+    ],
+    "files": [
+      "local-1792906448097"
+    ],
+    "seconds": 3.0,
+    "spark_version": "3.5.9"
+  },
+  "skew_join_split": {
+    "app_id": "local-1792906440393",
+    "conf": {
+      "spark.eventLog.compress": "false",
+      "spark.eventLog.rolling.enabled": "false",
+      "spark.sql.adaptive.advisoryPartitionSizeInBytes": "1MB",
+      "spark.sql.adaptive.enabled": "true",
+      "spark.sql.adaptive.skewJoin.skewedPartitionFactor": "2",
+      "spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes": "1MB",
+      "spark.sql.autoBroadcastJoinThreshold": "-1"
+    },
+    "expected": [
+      "aqe-skew-split"
+    ],
+    "files": [
+      "local-1792906440393"
+    ],
+    "seconds": 2.5,
+    "spark_version": "3.5.9"
+  },
+  "skew_join_unsplit": {
+    "app_id": "local-1792906436820",
+    "conf": {
+      "spark.eventLog.compress": "false",
+      "spark.eventLog.rolling.enabled": "false",
+      "spark.sql.adaptive.coalescePartitions.enabled": "false",
+      "spark.sql.adaptive.enabled": "true",
+      "spark.sql.autoBroadcastJoinThreshold": "-1"
+    },
+    "expected": [
+      "task-skew",
+      "skew-join-not-split"
+    ],
+    "files": [
+      "local-1792906436820"
+    ],
+    "seconds": 3.5,
+    "spark_version": "3.5.9"
+  },
+  "skew_repartition": {
+    "app_id": "local-1792906431255",
+    "conf": {
+      "spark.eventLog.compress": "false",
+      "spark.eventLog.rolling.enabled": "false"
+    },
+    "expected": [
+      "task-skew"
+    ],
+    "files": [
+      "local-1792906431255"
+    ],
+    "seconds": 5.5,
+    "spark_version": "3.5.9"
+  },
+  "spill": {
+    "app_id": "local-1792906444000",
+    "conf": {
+      "spark.eventLog.compress": "false",
+      "spark.eventLog.rolling.enabled": "false",
+      "spark.shuffle.spill.numElementsForceSpillThreshold": "20000"
+    },
+    "expected": [
+      "spill"
+    ],
+    "files": [
+      "local-1792906444000"
+    ],
+    "seconds": 2.0,
+    "spark_version": "3.5.9"
+  },
+  "task_failures": {
+    "app_id": "local-1792906451166",
+    "conf": {
+      "master": "local[2,2]",
+      "spark.eventLog.compress": "false",
+      "spark.eventLog.rolling.enabled": "false"
+    },
+    "expected": [
+      "task-failures"
+    ],
+    "files": [
+      "local-1792906451166"
+    ],
+    "seconds": 2.1,
+    "spark_version": "3.5.9"
+  },
+  "tiny_tasks": {
+    "app_id": "local-1792906446047",
+    "conf": {
+      "spark.eventLog.compress": "false",
+      "spark.eventLog.rolling.enabled": "false"
+    },
+    "expected": [
+      "too-many-small-tasks"
+    ],
+    "files": [
+      "local-1792906446047"
+    ],
+    "seconds": 2.0,
+    "spark_version": "3.5.9"
+  }
+}

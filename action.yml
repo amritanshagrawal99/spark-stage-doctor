@@ -1,0 +1,46 @@
+name: Spark stage doctor
+description: Diagnose Spark event logs (skew, spill, tiny tasks, broadcast candidates, AQE gates) in CI
+branding:
+  icon: activity
+  color: orange
+inputs:
+  path:
+    description: Event log file, rolling directory, History Server .zip, Databricks folder, or a directory of logs
+    required: true
+  baseline:
+    description: Optional baseline log of the same job; when set, the step compares the two runs instead
+    required: false
+    default: ""
+  profile:
+    description: "default, or dev for small/test jobs (lower absolute floors)"
+    required: false
+    default: default
+  fail-on:
+    description: "Fail the step on findings at or above: info, warn, critical, never (ignored with baseline: fails on regression)"
+    required: false
+    default: critical
+  python-version:
+    required: false
+    default: "3.12"
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+    - shell: bash
+      run: pip install --quiet "${{ github.action_path }}"
+    - shell: bash
+      env:
+        LOG_PATH: ${{ inputs.path }}
+        BASELINE: ${{ inputs.baseline }}
+        PROFILE: ${{ inputs.profile }}
+        FAIL_ON: ${{ inputs.fail-on }}
+      run: |
+        if [ -n "$BASELINE" ]; then
+          spark-stage-doctor compare "$BASELINE" "$LOG_PATH" --profile "$PROFILE" --format md --no-fail >> "$GITHUB_STEP_SUMMARY"
+          spark-stage-doctor compare "$BASELINE" "$LOG_PATH" --profile "$PROFILE"
+        else
+          spark-stage-doctor "$LOG_PATH" --profile "$PROFILE" --format md >> "$GITHUB_STEP_SUMMARY"
+          spark-stage-doctor "$LOG_PATH" --profile "$PROFILE" --min-severity warn --fail-on "$FAIL_ON"
+        fi
