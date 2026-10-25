@@ -73,6 +73,9 @@ Logs still being written are fine: a cut-off last line or compressed block is dr
 | `container-memory` | an executor's process-tree RSS reached 90% of heap + overhead, the point where YARN / Kubernetes kill it (exit 137) | project |
 | `shuffle-heavy` | >= 1 GiB shuffled with a high write / fetch-wait share | project |
 | `low-utilisation` | tasks used < 50% of the cores while jobs ran | project |
+| `stream-falling-behind` / `stream-saturated` | structured streaming: batches run back to back (>= 95% of each trigger interval busy) AND the backlog grows (batch sizes up 1.2x, or `latestOffset` ahead of `endOffset`); saturated without growth is info | project (see below) |
+| `stream-state-growth` | a state operator's rows rise in >= 90% of batches to 1.5x the midpoint; a warning when there is no watermark (state is never dropped) | project |
+| `stream-late-rows` / `stream-slow-commits` / `stream-failed` | rows dropped by the watermark; offset + commit log writes >= 30% of batch time and >= 1 s each (slow checkpoint storage); a query that terminated with an error | project |
 
 Ratios are the same in both profiles. `--profile dev` only lowers the absolute floors (a 30 s slowest task, 100 MiB
 partitions, 2000 tasks, 60 s stages, and so on), so small and test jobs can be checked too.
@@ -110,6 +113,10 @@ These details decide whether the numbers are right. Each was checked against Spa
   `Update`, never the running stage total in `Value`.
 - **Configs are explicit-only.** "Spark Properties" lists what was set, so defaults are applied by version (AQE on
   since 3.2; speculation 1.5x / 0.75 in 3.x, 3x / 0.9 in 4.0). Per-query overrides (`modifiedConfigs`) win.
+- **Spark's own streaming input rate can't show a falling-behind query.** `inputRowsPerSecond` divides a
+  batch's rows by the time since the previous trigger. On a real log it read 1.5M rows/s against 0.6M processed,
+  for a query that was idle 30% of the time with no backlog. The rate source emits whole seconds of rows, and
+  trigger alignment shortens the interval. The rule uses busy time between triggers plus backlog growth instead.
 - **Spark's lz4 and snappy are Java block formats** (lz4-java's `LZ4Block`, snappy-java's xerial stream), not the
   standard LZ4 frame or Snappy framing formats, so generic Python readers can't open them. They are parsed by hand
   here, and LZF is decoded in pure Python.
@@ -120,7 +127,9 @@ These details decide whether the numbers are right. Each was checked against Spa
 ([fixtures workflow](.github/workflows/fixtures.yml)). It writes one application per scenario: clean, plain-shuffle
 skew, a skewed join AQE doesn't split, one it does split, broadcast disabled, forced spill, 1000 tiny tasks, a
 `coalesce(1)` stage, injected task failures, 120 tiny CSV files, and, on `local-cluster` with two real executor
-JVMs, a task that SIGKILLs its own executor and a cached workload with 100 ms executor-metric polling, and the clean app under every event-log codec and Spark's default
+JVMs, a task that SIGKILLs its own executor and a cached workload with 100 ms executor-metric polling,
+three structured streaming queries (healthy windowed aggregation, unbounded state, and an overloaded one that falls
+behind on Spark 3.5 but runs at exactly full capacity on 4.0, so each version gets its own correct verdict), and the clean app under every event-log codec and Spark's default
 layout. The logs are committed, so the tests need no JVM.
 
 - **Every scenario must produce exactly its intended findings, and the clean baseline none,** on both Spark versions.
@@ -142,6 +151,9 @@ What the real logs caught that the docs and the synthetic tests didn't:
 - **Used heap is a poor sizing signal.** On 3 GiB executors, used heap peaked at 13% on Spark 3.5 but 32% on 4.0 for
   the same job, mostly uncollected garbage. Spark's managed memory was 16% on both, so sizing uses that.
 - **Spark 4.0's default log** is a rolling directory with zstd (confirmed).
+- **Stopping a streaming query cancels its in-flight batch.** The stage gets a failure reason ("Job N cancelled
+  part of cancelled job group" on 3.5, "[SPARK_JOB_CANCELLED]" on 4.0) without a failed task. That isn't reported
+  as a failure.
 
 ## Limitations
 
@@ -155,7 +167,8 @@ What the real logs caught that the docs and the synthetic tests didn't:
   reported as a ratio.
 - Skew is measured per task. When AQE coalesces a skewed stage down to a handful of tasks, there is too little
   distribution to call it skew (fewer than 10 successful tasks, or 5 with `--profile dev`).
-- Structured streaming queries are parsed, but there are no streaming-specific rules yet.
+- Streaming rules read `StreamingQueryProgress` events. The trigger interval itself isn't logged, so saturation is
+  measured from the gaps between triggers.
 
 ## Prior art
 

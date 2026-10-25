@@ -26,10 +26,18 @@ EXPECTED = {
     "single_task": {"too-few-tasks"},
     "task_failures": {"task-failures"},
     "small_files": {"small-files"},
+    "stream_healthy": set(),
+    "stream_unbounded_state": {"stream-state-growth"},
+    "stream_falling_behind": {"stream-falling-behind"},          # Spark 4.0: see VERSION_EXPECTED
     # local-cluster[2,1,...]: two real executor JVMs
     "executor_lost": {"task-failures"},
     "executor_memory": {"executor-memory"},
 }
+
+
+# The same 240k rows/s stream is beyond Spark 3.5's hashing speed (batches grow 240k -> 1.68M rows) and exactly at
+# Spark 4.0's (every batch 240k rows in ~1 s, back to back): falling behind vs saturated, both correct.
+VERSION_EXPECTED = {("spark-4.0", "stream_falling_behind"): {"stream-saturated"}}
 
 
 def run(version, scenario, th=rules.DEV):
@@ -42,7 +50,8 @@ def run(version, scenario, th=rules.DEV):
 @pytest.mark.parametrize("scenario", sorted(EXPECTED))
 def test_scenario_produces_exactly_its_findings(version, scenario):
     d = run(version, scenario)
-    assert {f.rule for f in d.findings} == EXPECTED[scenario], [(f.rule, f.title) for f in d.findings]
+    want = VERSION_EXPECTED.get((version, scenario), EXPECTED[scenario])
+    assert {f.rule for f in d.findings} == want, [(f.rule, f.title) for f in d.findings]
 
 
 @pytest.mark.parametrize("version", VERSIONS)
@@ -51,7 +60,8 @@ def test_default_profile_is_quiet_on_tiny_jobs(version, scenario):
     """Production floors (30 s tasks, 100 MiB partitions, 2000 tasks...) must not fire on 1-second test jobs,
     except where the evidence is not size-dependent (failed tasks, broadcast disabled for a tiny side, any spill, 100+ tiny files)."""
     rules_hit = {f.rule for f in run(version, scenario, rules.DEFAULT).findings}
-    assert rules_hit <= {"task-failures", "broadcast-candidate", "spill", "aqe-skew-split", "small-files"}, rules_hit
+    assert rules_hit <= {"task-failures", "broadcast-candidate", "spill", "aqe-skew-split", "small-files",
+                         "stream-state-growth", "stream-falling-behind", "stream-saturated"}, rules_hit
 
 
 @pytest.mark.parametrize("version", VERSIONS)

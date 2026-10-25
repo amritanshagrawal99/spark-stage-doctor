@@ -7,6 +7,7 @@ Two profiles share the same ratios and differ only in absolute floors (seconds, 
 """
 from __future__ import annotations
 
+import datetime as dt
 import math
 import re
 from collections import Counter
@@ -32,12 +33,14 @@ class Thresholds:
     utilisation_min_app_ms: int = 5 * 60_000
     small_files_min_count: int = 100
     memory_min_task_ms: int = 10 * 60_000     # total task time before memory sizing is worth judging
+    stream_min_batches: int = 10
 
 
 DEFAULT = Thresholds()
 DEV = Thresholds(min_tasks=5, skew_min_max_task_ms=1000, data_skew_min_bytes=MiB, small_tasks_min_count=200,
                  few_tasks_min_wall_ms=1000, gc_min_run_ms=2000, shuffle_heavy_min_bytes=16 * MiB,
-                 utilisation_min_app_ms=5000, small_files_min_count=50, memory_min_task_ms=2000)
+                 utilisation_min_app_ms=5000, small_files_min_count=50, memory_min_task_ms=2000,
+                 stream_min_batches=5)
 PROFILES = {"default": DEFAULT, "dev": DEV}
 
 
@@ -97,6 +100,7 @@ def _bool(v: str | None, default: bool) -> bool:
 
 def _where(app: App, s: Stage) -> str:
     desc = s.description or (app.sql[s.sql_id].description if s.sql_id in app.sql else "") or s.name
+    desc = " ".join(desc.split())        # streaming job descriptions span several lines
     job = f"job {s.job_id}" if s.job_id is not None else "no job"
     return f"{s.label} ({job}{': ' + desc[:80] if desc else ''})"
 
@@ -396,12 +400,15 @@ def error_line(text: str | None) -> str:
 
 # "Command exited with code 137" is what a SIGKILLed executor reports (seen on a real log): the usual sender is the
 # OS / YARN / Kubernetes OOM killer.
+_CANCELLED = re.compile(r"\bcancell?ed\b", re.I)    # job group / query stop / SparkContext shutdown
 _OOM = re.compile(r"OutOfMemory|exceeding memory limits|Container killed|exit(ed)? (with )?code 137|killed by YARN|"
                   r"memoryOverhead|OOMKilled", re.I)
 
 
 def failures(app: App, s: Stage, th: Thresholds) -> list[Finding]:
     failed = [t for t in s.tasks if t.reason in FAILED_REASONS]
+    if s.failure and not failed and _CANCELLED.search(s.failure):
+        return []   # cancelled (job group cancelled, query stopped, SparkContext shut down): not a failure
     killed = [t for t in s.tasks if t.reason == "TaskKilled" and (t.kill_reason or "").startswith("another attempt")]
     out: list[Finding] = []
     if failed or s.failure or s.attempt > 0:
@@ -649,7 +656,7 @@ def executor_memory(app: App, th: Thresholds) -> list[Finding]:
                            ["Raise spark.executor.memory, or lower spark.executor.cores so each task gets more memory.",
                             "Make partitions smaller (more shuffle partitions) so less data is held per task."],
                            ev, "Spark UI (GC red at 10%); project", where=where))
-    elif (managed_use is not None and managed_use < 0.3 and use < 0.5
+    elif (not local and managed_use is not None and managed_use < 0.3 and use < 0.5
           and heap - max(1 << 30, int(peak_heap * 1.5)) >= 1 << 30):        # worth it only if it frees >= 1 GiB
         suggested = max(1 << 30, int(peak_heap * 1.5))
         out.append(Finding("executor-memory", "info",
@@ -659,6 +666,146 @@ def executor_memory(app: App, th: Thresholds) -> list[Finding]:
                            f"on {len(peaks)} executor(s). Peaks are sampled, so treat this as a size to test, not a guarantee.",
                            [f"Try spark.executor.memory={memory_size(suggested)}, or more cores per executor with the same "
                             "memory; re-check after the change."], ev, "project", where=where))
+    return out
+
+
+def _num(v) -> float | None:
+    """Progress JSON numbers; rates can be the string "NaN" (first batch) or missing."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(f) or math.isinf(f) else f
+
+
+def _ts_ms(p: dict) -> float | None:
+    try:
+        return dt.datetime.fromisoformat(str(p.get("timestamp", "")).replace("Z", "+00:00")).timestamp() * 1000
+    except ValueError:
+        return None
+
+
+def _backlog(p: dict) -> bool:
+    """A source reported more data available (latestOffset, 3.1+) than the batch took (endOffset): a rate limit
+    such as maxOffsetsPerTrigger is holding data back."""
+    return any(x.get("latestOffset") is not None and x.get("endOffset") is not None
+               and x.get("latestOffset") != x.get("endOffset") for x in p.get("sources") or [])
+
+
+def _falling_behind(q, prog: list[dict]) -> list[Finding]:
+    """Falling behind = no idle time between batches AND a growing backlog.
+
+    Spark's own inputRowsPerSecond vs processedRowsPerSecond (what the UI plots) is NOT used: input rate divides by
+    the time since the previous trigger, which a quantised source (the rate source emits whole seconds) or trigger
+    alignment inflates. On a real log it showed input 1.5M/s vs processed 0.6M/s for a query with 30% idle time and
+    no backlog. Instead: busy share = batch duration / time to the next trigger, plus batch-size growth or offsets
+    left behind."""
+    recent = prog[max(1, len(prog) // 3):]              # past the start-up batches
+    busy = []
+    for a, b in zip(recent, recent[1:], strict=False):
+        ta, tb = _ts_ms(a), _ts_ms(b)
+        if ta is not None and tb is not None and tb > ta:
+            busy.append((_num(a.get("batchDuration")) or 0) / (tb - ta))
+    if len(busy) < 3 or median(busy) < 0.95:
+        return []
+    rows = [r for r in (sum(x.get("numInputRows", 0) for x in p.get("sources") or []) for p in recent) if r]
+    third = max(1, len(rows) // 3)
+    growth = (sum(rows[-third:]) / third) / max(sum(rows[:third]) / third, 1) if rows else 1.0
+    backlog = sum(1 for p in recent if _backlog(p))
+    ev = {"batches": len(prog), "median_busy_share": round(median(busy), 2), "batch_rows_growth": round(growth, 2),
+          "batches_with_backlog": backlog, "first_rows": rows[0] if rows else 0, "last_rows": rows[-1] if rows else 0}
+    fixes = ["Add parallelism: more cores / executors, and more source partitions (Kafka minPartitions, the rate "
+             "source's numPartitions).",
+             "Bound each batch (maxOffsetsPerTrigger for Kafka, maxFilesPerTrigger for files) so latency stays "
+             "predictable while it catches up.",
+             "Cut per-row work (UDFs, repeated hashing, wide projections) or move it after a filter."]
+    if growth >= 1.2 or backlog:
+        why = (f"batch sizes grew {growth:.1f}x (from {ev['first_rows']:,} to {ev['last_rows']:,} rows)" if growth >= 1.2
+               else f"{backlog} batches left data behind (latestOffset ahead of endOffset)")
+        return [Finding("stream-falling-behind", "critical" if growth >= 2 else "warn", "Streaming query is falling behind",
+                        f"Batches ran back to back (median {median(busy):.0%} of the time between triggers was spent "
+                        f"processing) and {why}, so latency keeps growing.", fixes, ev,
+                        "project (Spark's input vs processed rate is not reliable: see docs)", where=q.label)]
+    return [Finding("stream-saturated", "info", "Streaming query has no headroom",
+                    f"Batches ran back to back (median {median(busy):.0%} of the time between triggers was spent "
+                    "processing), though the backlog is not growing yet. Any increase in input will make it fall behind.",
+                    fixes[:1], ev, "project", where=q.label)]
+
+
+def _state_growth(q, prog: list[dict]) -> list[Finding]:
+    """State that only grows. Without a watermark, Spark keeps every key's state forever."""
+    out = []
+    watermark = any((p.get("eventTime") or {}).get("watermark") for p in prog)
+    n_ops = max((len(p.get("stateOperators") or []) for p in prog), default=0)
+    for k in range(n_ops):
+        series = [(p.get("stateOperators") or [])[k] if k < len(p.get("stateOperators") or []) else {} for p in prog]
+        totals = [_num(x.get("numRowsTotal")) or 0 for x in series]
+        mid, last = totals[len(totals) // 2], totals[-1]
+        growing = sum(1 for a, b in zip(totals, totals[1:], strict=False) if b >= a) / max(len(totals) - 1, 1)
+        # Steady growth: up (or flat) in >= 90% of batches and 1.5x the midpoint by the end. Linear growth from zero
+        # ends at ~2x the midpoint; bounded state oscillates around a level.
+        if not (last > 0 and last >= 1.5 * max(mid, 1) and growing >= 0.9):
+            continue
+        mem = _num(series[-1].get("memoryUsedBytes")) or 0
+        op = series[-1].get("operatorName") or f"state operator {k}"
+        if watermark:
+            fixes = ["A watermark is set but state still grows: its delay may be longer than this run, or the grouping "
+                     "key has no event-time window, so nothing ever expires."]
+        else:
+            fixes = ["Add a watermark (`withWatermark('event_time', '10 minutes')`) and group by an event-time window so "
+                     "old state can be dropped; for dropDuplicates use dropDuplicatesWithinWatermark (3.5+).",
+                     "For arbitrary state, expire it explicitly: timeouts in (flat)MapGroupsWithState, or TTL in "
+                     "transformWithState (4.0)."]
+        fixes.append("Large state belongs in RocksDB: spark.sql.streaming.stateStore.providerClass="
+                     "org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider.")
+        out.append(Finding("stream-state-growth", "info" if watermark else "warn",
+                           f"Streaming state keeps growing: {int(last):,} rows" + ("" if watermark else ", no watermark"),
+                           f"{op} held {int(mid):,} rows halfway through and {int(last):,} at the end "
+                           f"({human_bytes(mem)} in memory), growing in {growing:.0%} of batches."
+                           + ("" if watermark else " The query has no watermark, so this state is never dropped."),
+                           fixes, {"operator": op, "rows_mid": int(mid), "rows_last": int(last), "memory_bytes": int(mem),
+                                   "watermark": watermark}, "project", where=q.label))
+    return out
+
+
+def _late_rows_and_commits(q, prog: list[dict]) -> list[Finding]:
+    out = []
+    dropped = sum(_num(x.get("numRowsDroppedByWatermark")) or 0 for p in prog for x in p.get("stateOperators") or [])
+    if dropped:
+        out.append(Finding("stream-late-rows", "info", f"{int(dropped):,} late rows dropped by the watermark",
+                           f"State operators dropped {int(dropped):,} rows that arrived later than the watermark allows.",
+                           ["If those rows matter, lengthen the watermark delay (at the cost of more state)."],
+                           {"dropped_rows": int(dropped)}, "project", where=q.label))
+    # Checkpoint commits dominating batch time: slow checkpoint storage (an object store). Local-disk commits take
+    # tens of ms, so the 1 s mean keeps tiny batches with cheap commits from tripping this.
+    trig = sum(_num((p.get("durationMs") or {}).get("triggerExecution")) or 0 for p in prog)
+    commits = [(_num((p.get("durationMs") or {}).get("walCommit")) or 0) + (_num((p.get("durationMs") or {}).get("commit")) or 0)
+               for p in prog]
+    mean = sum(commits) / len(commits)
+    if trig and sum(commits) / trig >= 0.3 and mean >= 1000:
+        out.append(Finding("stream-slow-commits", "warn", f"Checkpoint commits take {sum(commits) / trig:.0%} of batch time",
+                           f"Writing the offset log and commit log averaged {human_ms(mean)} per batch. On object stores "
+                           "each commit is several small writes.",
+                           ["Put the checkpoint on faster storage, or trigger less often so the fixed cost is shared by "
+                            "more data.",
+                            "With RocksDB state: spark.sql.streaming.stateStore.rocksdb.changelogCheckpointing.enabled=true."],
+                           {"commit_share": round(sum(commits) / trig, 3), "mean_commit_ms": round(mean)}, "project",
+                           where=q.label))
+    if q.exception:
+        out.append(Finding("stream-failed", "critical", "Streaming query terminated with an error", error_line(q.exception),
+                           ["Fix the error; the query restarts from its checkpoint."], {"error": q.exception[:500]},
+                           where=q.label))
+    return out
+
+
+def streaming(app: App, th: Thresholds) -> list[Finding]:
+    out = []
+    for q in app.streams.values():
+        prog = sorted(q.progress, key=lambda p: p.get("batchId", 0))
+        if q.exception or len(prog) >= th.stream_min_batches:
+            if len(prog) >= th.stream_min_batches:
+                out += _falling_behind(q, prog) + _state_growth(q, prog)
+            out += _late_rows_and_commits(q, prog) if prog else []
     return out
 
 
@@ -698,6 +845,7 @@ def diagnose(app: App, th: Thresholds = DEFAULT) -> list[Finding]:
     out += broadcast_candidates(app, th)
     out += small_files(app, th)
     out += executor_memory(app, th)
+    out += streaming(app, th)
     out += utilisation(app, th)
     order = {k: i for i, k in enumerate(reversed(SEVERITIES))}
     return sorted(out, key=lambda f: (order[f.severity], f.stage or (1 << 30, 0), f.rule))
