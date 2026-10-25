@@ -140,6 +140,39 @@ def executor_memory(spark):
     noop(df.groupBy((F.col("id") % 1000).alias("g")).agg(F.countDistinct("p")))
 
 
+def _stream(spark, name, df, mode="update", seconds=14):
+    """Run a streaming query into the noop sink for `seconds`, with a 500 ms trigger and a fresh checkpoint."""
+    ckpt = os.path.join(OUT, "_data", f"ckpt-{name}")
+    shutil.rmtree(ckpt, ignore_errors=True)
+    q = (df.writeStream.format("noop").queryName(name).outputMode(mode).option("checkpointLocation", ckpt)
+         .trigger(processingTime="500 milliseconds").start())
+    q.awaitTermination(seconds)
+    q.stop()
+
+
+def stream_healthy(spark):
+    """Windowed count with a watermark at a modest rate: keeps up, state stays bounded."""
+    df = spark.readStream.format("rate").option("rowsPerSecond", 200).load()
+    agg = (df.withWatermark("timestamp", "2 seconds")
+           .groupBy(F.window("timestamp", "1 second"), (F.col("value") % 10).alias("k")).count())
+    _stream(spark, "stream_healthy", agg)
+
+
+def stream_unbounded_state(spark):
+    """Grouping by an ever-new key with no watermark: the state store grows every batch."""
+    df = spark.readStream.format("rate").option("rowsPerSecond", 2000).load()
+    _stream(spark, "stream_unbounded_state", df.groupBy("value").count())
+
+
+def stream_falling_behind(spark):
+    """Far more input than 2 cores can hash: each batch is bigger than the last, processing rate < input rate."""
+    df = spark.readStream.format("rate").option("rowsPerSecond", 400_000).option("numPartitions", 2).load()
+    h = F.col("value").cast("string")
+    for _ in range(6):
+        h = F.sha2(h, 512)
+    _stream(spark, "stream_falling_behind", df.select(h.alias("h")), mode="append")
+
+
 CLUSTER = "local-cluster[2,1,1024]"   # 2 executor JVMs, 1 core and 1 GiB each (needs SPARK_HOME; Linux only)
 OPTIONAL = {"executor_lost", "executor_memory"}
 
@@ -162,6 +195,9 @@ SCENARIOS = {
     # local[N] ignores spark.task.maxFailures (always 1); local[N,F] allows F attempts per task.
     "task_failures": ({"master": "local[2,2]"}, task_failures, ["task-failures"]),
     "small_files": ({}, small_files, ["small-files"]),
+    "stream_healthy": ({}, stream_healthy, []),
+    "stream_unbounded_state": ({}, stream_unbounded_state, ["stream-state-growth"]),
+    "stream_falling_behind": ({}, stream_falling_behind, ["stream-falling-behind"]),
     "executor_lost": ({"master": CLUSTER}, executor_lost, ["task-failures"]),
     # local-cluster's last number is the WORKER's memory; executors still default to spark.executor.memory=1g.
     "executor_memory": ({"master": "local-cluster[2,1,4096]", "spark.executor.memory": "3g",
