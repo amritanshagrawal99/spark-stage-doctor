@@ -700,7 +700,7 @@ def _falling_behind(q, prog: list[dict]) -> list[Finding]:
     alignment inflates. On a real log it showed input 1.5M/s vs processed 0.6M/s for a query with 30% idle time and
     no backlog. Instead: busy share = batch duration / time to the next trigger, plus batch-size growth or offsets
     left behind."""
-    recent = prog[len(prog) // 2:]                      # the second half: past the start-up batches
+    recent = prog[max(1, len(prog) // 3):]              # past the start-up batches
     busy = []
     for a, b in zip(recent, recent[1:], strict=False):
         ta, tb = _ts_ms(a), _ts_ms(b)

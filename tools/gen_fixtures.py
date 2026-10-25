@@ -165,12 +165,13 @@ def stream_unbounded_state(spark):
 
 
 def stream_falling_behind(spark):
-    """More input than 2 cores can hash (~3x): batches run back to back and each picks up a bigger backlog."""
-    df = spark.readStream.format("rate").option("rowsPerSecond", 400_000).option("numPartitions", 2).load()
+    """~1.5x more input than 2 cores can hash (~200k rows/s): batches run back to back, each picking up a bigger
+    backlog (a geometric 1.5x per batch), for 30 s."""
+    df = spark.readStream.format("rate").option("rowsPerSecond", 300_000).option("numPartitions", 2).load()
     h = F.col("value").cast("string")
     for _ in range(18):
         h = F.sha2(h, 512)
-    _stream(spark, "stream_falling_behind", df.select(h.alias("h")), mode="append")
+    _stream(spark, "stream_falling_behind", df.select(h.alias("h")), mode="append", seconds=30)
 
 
 CLUSTER = "local-cluster[2,1,1024]"   # 2 executor JVMs, 1 core and 1 GiB each (needs SPARK_HOME; Linux only)
