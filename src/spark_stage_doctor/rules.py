@@ -422,16 +422,28 @@ def failures(app: App, s: Stage, th: Thresholds) -> list[Finding]:
                                       "errors": dict(Counter(f"{r} {c}".strip() for r, c in groups.elements())),
                                       "stage_failed": bool(s.failure)},
                             source="Dr. Elephant (task failure rate 0.1 / 0.3 / 0.5)"))
+    # "another attempt succeeded" kills the LOSER. A killed speculative copy is pure waste; a killed original means
+    # the copy won, i.e. speculation rescued a straggler.
     run = sum(t.run_ms for t in s.tasks)
-    wasted = sum(t.run_ms for t in killed)
-    if killed and ratio(wasted, run) >= 0.05:
+    lost_copies = [t for t in killed if t.speculative]
+    won = [t for t in killed if not t.speculative]
+    wasted = sum(t.run_ms for t in lost_copies)
+    if lost_copies and ratio(wasted, run) >= 0.05:
         out.append(_finding(app, s, rule="speculation-waste", severity="warn",
                             title=f"Speculation wasted {ratio(wasted, run):.0%} of task time",
-                            detail=f"{len(killed)} speculative or original attempts were killed because another "
-                                   f"attempt finished first, after running {human_ms(wasted)}.",
-                            fixes=["Raise spark.speculation.multiplier / spark.speculation.quantile, or disable "
-                                   "speculation for this job if the slow tasks are data skew (copies read the same data)."],
-                            evidence={"killed_attempts": len(killed), "wasted_run_ms": wasted, "run_ms": run}))
+                            detail=f"{len(lost_copies)} speculative copies ran {human_ms(wasted)} and were killed because "
+                                   "the original attempt finished first: the originals were not stragglers.",
+                            fixes=["Make speculation pickier: raise spark.speculation.multiplier / spark.speculation.quantile "
+                                   "(or spark.speculation.minTaskRuntime); disable it for this job if slow tasks are data "
+                                   "skew, since a copy reads the same data."],
+                            evidence={"killed_copies": len(lost_copies), "wasted_run_ms": wasted, "run_ms": run}))
+    if won:
+        out.append(_finding(app, s, rule="speculation-helped", severity="info",
+                            title=f"Speculation rescued {len(won)} straggling task{'s' if len(won) > 1 else ''}",
+                            detail=f"For {len(won)} partition{'s' if len(won) > 1 else ''} a speculative copy finished first "
+                                   f"and the original was killed after {human_ms(sum(t.run_ms for t in won))}. Look at the "
+                                   f"hosts of the originals ({', '.join(sorted({t.host for t in won}))}) for slow nodes.",
+                            evidence={"rescued": len(won), "original_run_ms": sum(t.run_ms for t in won)}))
     return out
 
 

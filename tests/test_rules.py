@@ -139,10 +139,14 @@ def test_fetch_failure_and_stage_retry():
     assert "stage FAILED" in fs[0].detail and "retry attempt 1" in fs[1].detail
 
 
-def test_speculation_waste():
-    evs = [E.task(0, 0, 40_000, reason="TaskKilled", speculative=True, **{"Kill Reason": "another attempt succeeded"}),
-           E.task(0, 0, 50_000, attempt=1)]
-    assert by_rule(diagnose(E.stage(0, 1), evs), "speculation-waste")
+def test_speculation_waste_counts_only_killed_copies():
+    lost = [E.task(0, 0, 50_000), E.task(0, 0, 40_000, attempt=1, reason="TaskKilled", speculative=True,
+                                         **{"Kill Reason": "another attempt succeeded"})]
+    won = [E.task(0, 0, 60_000, reason="TaskKilled", **{"Kill Reason": "another attempt succeeded"}),
+           E.task(0, 0, 5_000, attempt=1, speculative=True)]
+    a, b = diagnose(E.stage(0, 1), lost), diagnose(E.stage(0, 1), won)
+    assert by_rule(a, "speculation-waste") and not by_rule(a, "speculation-helped")
+    assert by_rule(b, "speculation-helped") and not by_rule(b, "speculation-waste")
 
 
 def test_small_tasks_advice_depends_on_the_source():

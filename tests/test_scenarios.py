@@ -139,7 +139,7 @@ def test_apache_spark_test_logs_parse(path):
 def test_real_speculation_in_apache_log():
     d = analyse(FIX / "apache-spark" / "application_1628109047826_1317105.json")[0]
     f = next(f for f in d.findings if f.rule == "speculation-waste")
-    assert f.evidence["killed_attempts"] == 1 and f.evidence["wasted_run_ms"] > 50_000
+    assert f.evidence["killed_copies"] == 1 and f.evidence["wasted_run_ms"] > 50_000
 
 
 @pytest.mark.parametrize("version", VERSIONS)
