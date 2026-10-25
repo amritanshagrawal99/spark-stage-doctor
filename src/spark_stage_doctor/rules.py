@@ -84,6 +84,13 @@ def spark_size(n: float) -> str:
     return str(int(n))
 
 
+def memory_size(n: float) -> str:
+    """A memory setting to suggest: rounded UP to 256 MiB, so a suggestion never undercuts what was measured."""
+    q = 256 * MiB
+    n = -(-int(n) // q) * q
+    return f"{n >> 30}g" if n % (1 << 30) == 0 else f"{n >> 20}m"
+
+
 def _bool(v: str | None, default: bool) -> bool:
     return default if v is None else str(v).strip().lower() == "true"
 
@@ -618,7 +625,13 @@ def executor_memory(app: App, th: Thresholds) -> list[Finding]:
               + p.get("ProcessTreeOtherRSSMemory", 0) for p in peaks.values())
     gc = ratio(sum(t.gc_ms for s in app.stages.values() for t in s.tasks), task_ms)
     use = peak_heap / heap
+    # Spark's managed memory (execution + storage) against its unified region: what Spark itself needed. Used heap
+    # alone mostly measures uncollected garbage, which grows with whatever heap is available.
+    unified = {e: (p.get("OnHeapExecutionMemory", 0) + p.get("OnHeapStorageMemory", 0)) for e, p in peaks.items()}
+    regions = {e: app.executors[e].max_onheap for e in peaks if e in app.executors and app.executors[e].max_onheap}
+    managed_use = max((unified[e] / regions[e] for e in regions), default=None)
     ev = {"executors": len(peaks), "heap_bytes": heap, "peak_heap_bytes": peak_heap, "heap_use": round(use, 3),
+          "peak_managed_use": round(managed_use, 3) if managed_use is not None else None,
           "peak_rss_bytes": rss, "container_bytes": heap + overhead, "gc_share": round(gc, 3)}
     where = "application" + (" (local mode: the driver is the executor)" if local else "")
     out = []
@@ -636,12 +649,15 @@ def executor_memory(app: App, th: Thresholds) -> list[Finding]:
                            ["Raise spark.executor.memory, or lower spark.executor.cores so each task gets more memory.",
                             "Make partitions smaller (more shuffle partitions) so less data is held per task."],
                            ev, "Spark UI (GC red at 10%); project", where=where))
-    elif use < 0.3 and heap - max(1 << 30, int(peak_heap * 2)) >= 1 << 30:   # worth it only if it frees >= 1 GiB
-        suggested = max(1 << 30, int(peak_heap * 2))
-        out.append(Finding("executor-memory", "info", f"Executor heap peaked at {use:.0%}: likely over-provisioned",
-                           f"Used heap never went above {human_bytes(peak_heap)} of {human_bytes(heap)} on {len(peaks)} "
-                           "executor(s). Peaks are sampled, so treat this as a ceiling to test, not a guarantee.",
-                           [f"Try spark.executor.memory={spark_size(suggested)}, or more cores per executor with the same "
+    elif (managed_use is not None and managed_use < 0.3 and use < 0.5
+          and heap - max(1 << 30, int(peak_heap * 1.5)) >= 1 << 30):        # worth it only if it frees >= 1 GiB
+        suggested = max(1 << 30, int(peak_heap * 1.5))
+        out.append(Finding("executor-memory", "info",
+                           f"Executors used {managed_use:.0%} of Spark's memory: likely over-provisioned",
+                           f"Spark's execution + storage memory peaked at {managed_use:.0%} of its unified region, and "
+                           f"used heap (including uncollected garbage) at {human_bytes(peak_heap)} of {human_bytes(heap)}, "
+                           f"on {len(peaks)} executor(s). Peaks are sampled, so treat this as a size to test, not a guarantee.",
+                           [f"Try spark.executor.memory={memory_size(suggested)}, or more cores per executor with the same "
                             "memory; re-check after the change."], ev, "project", where=where))
     return out
 

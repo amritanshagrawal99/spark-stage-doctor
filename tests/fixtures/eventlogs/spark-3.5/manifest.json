@@ -94,6 +94,41 @@
     "seconds": 0.5,
     "spark_version": "3.5.9"
   },
+  "executor_lost": {
+    "app_id": "app-20261025055729-0000",
+    "conf": {
+      "master": "local-cluster[2,1,1024]",
+      "spark.eventLog.compress": "false",
+      "spark.eventLog.rolling.enabled": "false"
+    },
+    "expected": [
+      "task-failures"
+    ],
+    "files": [
+      "app-20261025055729-0000"
+    ],
+    "seconds": 4.3,
+    "spark_version": "3.5.9"
+  },
+  "executor_memory": {
+    "app_id": "app-20261025055734-0000",
+    "conf": {
+      "master": "local-cluster[2,1,4096]",
+      "spark.eventLog.compress": "false",
+      "spark.eventLog.rolling.enabled": "false",
+      "spark.executor.memory": "3g",
+      "spark.executor.metrics.pollingInterval": "100ms",
+      "spark.executor.processTreeMetrics.enabled": "true"
+    },
+    "expected": [
+      "executor-memory"
+    ],
+    "files": [
+      "app-20261025055734-0000"
+    ],
+    "seconds": 9.0,
+    "spark_version": "3.5.9"
+  },
   "single_task": {
     "app_id": "local-1792906448097",
     "conf": {

@@ -26,6 +26,9 @@ EXPECTED = {
     "single_task": {"too-few-tasks"},
     "task_failures": {"task-failures"},
     "small_files": {"small-files"},
+    # local-cluster[2,1,...]: two real executor JVMs
+    "executor_lost": {"task-failures"},
+    "executor_memory": {"executor-memory"},
 }
 
 
@@ -147,3 +150,21 @@ def test_small_files_reads_the_scan_driver_metrics(version):
     f = next(f for f in run(version, "small_files").findings if f.rule == "small-files")
     assert f.evidence["files"] == 120 and f.evidence["format"] == "CSV" and f.evidence["avg_file_bytes"] < 4096
     assert f.severity == "critical" and any("openCostInBytes (4m)" in x for x in f.fixes)
+
+
+@pytest.mark.parametrize("version", VERSIONS)
+def test_killed_executor_is_explained(version):
+    """The task SIGKILLs its executor JVM: exactly what the OOM killer does. Spark reports 'Command exited with
+    code 137' (the first rule version only matched 'exit code 137')."""
+    d = run(version, "executor_lost")
+    f = next(f for f in d.findings if f.rule == "task-failures")
+    assert f.severity == "warn" and "ExecutorLostFailure: Command exited with code 137" in f.detail
+    assert any("memoryOverhead" in x for x in f.fixes) and any("SIGKILLed" in x for x in f.fixes)
+    assert any(e.removed for e in d.app.executors.values())
+
+
+@pytest.mark.parametrize("version", VERSIONS)
+def test_executor_memory_uses_spark_managed_memory(version):
+    f = next(f for f in run(version, "executor_memory").findings if f.rule == "executor-memory")
+    assert f.evidence["heap_bytes"] == 3 << 30 and f.evidence["executors"] == 2
+    assert f.evidence["peak_managed_use"] < 0.3 and f.evidence["heap_use"] < 0.5

@@ -215,6 +215,7 @@ class Executor:
     added: int
     removed: int | None = None
     removed_reason: str | None = None
+    max_onheap: int = 0        # BlockManagerAdded: Spark's unified (execution + storage) on-heap region, in bytes
 
 
 @dataclass
@@ -232,6 +233,7 @@ class App:
     executor_peaks: dict[str, dict[str, int]] = field(default_factory=dict)   # executor -> metric -> peak
     profile_memory_mib: int | None = None          # default resource profile: executor heap (MiB)
     profile_overhead_mib: int | None = None
+    pending_block_managers: dict[str, int] = field(default_factory=dict)   # block manager seen before its executor
     unknown_events: Counter = field(default_factory=Counter)
     notes: list[str] = field(default_factory=list)
 
@@ -357,8 +359,17 @@ def build(events: list[dict]) -> App:
                 if isinstance(ev.get("Spark Properties"), dict) else {str(k): str(v) for k, v in ev.get("Spark Properties") or []}
         elif name == "SparkListenerExecutorAdded":
             info = ev.get("Executor Info", {})
-            app.executors[str(ev.get("Executor ID"))] = Executor(str(ev.get("Executor ID")), info.get("Host", ""),
-                                                                 _int(info.get("Total Cores")), _int(ev.get("Timestamp")))
+            eid = str(ev.get("Executor ID"))
+            app.executors[eid] = Executor(eid, info.get("Host", ""), _int(info.get("Total Cores")), _int(ev.get("Timestamp")),
+                                          max_onheap=app.pending_block_managers.pop(eid, 0))
+        elif name == "SparkListenerBlockManagerAdded":
+            bm = ev.get("Block Manager ID") or {}
+            e = app.executors.get(str(bm.get("Executor ID")))
+            if e:
+                e.max_onheap = _int(ev.get("Maximum Onheap Memory"), _int(ev.get("Maximum Memory")))
+            else:
+                app.pending_block_managers[str(bm.get("Executor ID"))] = _int(ev.get("Maximum Onheap Memory"),
+                                                                               _int(ev.get("Maximum Memory")))
         elif name == "SparkListenerExecutorRemoved":
             e = app.executors.get(str(ev.get("Executor ID")))
             if e:
@@ -452,7 +463,7 @@ def build(events: list[dict]) -> App:
     return app
 
 
-_IGNORED = {"SparkListenerTaskStart", "SparkListenerTaskGettingResult", "SparkListenerBlockManagerAdded",
+_IGNORED = {"SparkListenerTaskStart", "SparkListenerTaskGettingResult",
             "SparkListenerBlockManagerRemoved", "SparkListenerUnpersistRDD", "SparkListenerExecutorMetricsUpdate",
             "SparkListenerBlockUpdated", "SparkListenerResourceProfileAdded",
             "SparkListenerSpeculativeTaskSubmitted", "SparkListenerExecutorExcluded", "SparkListenerExecutorUnexcluded",
