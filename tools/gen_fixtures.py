@@ -118,7 +118,8 @@ SCENARIOS = {
     "spill": ({"spark.shuffle.spill.numElementsForceSpillThreshold": "20000"}, spill, ["spill"]),
     "tiny_tasks": ({}, tiny_tasks, ["too-many-small-tasks"]),
     "single_task": ({}, single_task, ["too-few-tasks"]),
-    "task_failures": ({"spark.task.maxFailures": "2"}, task_failures, ["task-failures"]),
+    # local[N] ignores spark.task.maxFailures (always 1); local[N,F] allows F attempts per task.
+    "task_failures": ({"master": "local[2,2]"}, task_failures, ["task-failures"]),
 }
 
 # The clean app again with each event-log codec (Spark 3.5 defaults to uncompressed; 4.0 to rolling + zstd).
@@ -127,7 +128,8 @@ CODEC_VARIANTS = {f"clean-{c}": c for c in ("zstd", "lz4", "snappy", "lzf")}
 
 def run_app(name: str, conf: dict, body, log_dir: str) -> dict:
     os.makedirs(log_dir, exist_ok=True)
-    b = SparkSession.builder.master("local[2]").appName(name)
+    conf = dict(conf)
+    b = SparkSession.builder.master(conf.pop("master", "local[2]")).appName(name)
     for k, v in {**BASE_CONF, **conf, "spark.eventLog.dir": "file://" + log_dir}.items():
         b = b.config(k, v)
     spark = b.getOrCreate()
