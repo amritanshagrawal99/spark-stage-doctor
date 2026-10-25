@@ -118,6 +118,31 @@ def small_files(spark):
     noop(df.groupBy("grp").count())
 
 
+def executor_lost(spark):
+    """Partition 0's first attempt SIGKILLs its own executor JVM: ExecutorLostFailure, then a retry elsewhere."""
+    def kill_executor(index, rows):
+        if index == 0 and TaskContext.get().attemptNumber() == 0:
+            daemon = os.getppid()                          # python worker -> pyspark daemon -> executor JVM
+            with open(f"/proc/{daemon}/stat") as f:
+                jvm = int(f.read().rsplit(")", 1)[1].split()[1])
+            os.kill(jvm, 9)
+            time.sleep(60)
+        yield sum(1 for _ in rows)
+    spark.sparkContext.parallelize(range(8000), 4).mapPartitionsWithIndex(kill_executor).collect()
+
+
+def executor_memory(spark):
+    """Cache ~200 MB on 4 GiB executors and aggregate it, with executor metrics polled every 100 ms so the peaks are
+    recorded. Peak heap stays far below 4 GiB: an over-provisioning case."""
+    df = (spark.range(0, 2_000_000, numPartitions=4)
+          .withColumn("p", F.sha2(F.col("id").cast("string"), 256)).cache())
+    df.count()
+    noop(df.groupBy((F.col("id") % 1000).alias("g")).agg(F.countDistinct("p")))
+
+
+CLUSTER = "local-cluster[2,1,1024]"   # 2 executor JVMs, 1 core and 1 GiB each (needs SPARK_HOME; Linux only)
+OPTIONAL = {"executor_lost", "executor_memory"}
+
 SCENARIOS = {
     "clean": ({}, clean, []),
     "skew_repartition": ({}, skew_repartition, ["task-skew"]),
@@ -137,6 +162,11 @@ SCENARIOS = {
     # local[N] ignores spark.task.maxFailures (always 1); local[N,F] allows F attempts per task.
     "task_failures": ({"master": "local[2,2]"}, task_failures, ["task-failures"]),
     "small_files": ({}, small_files, ["small-files"]),
+    "executor_lost": ({"master": CLUSTER}, executor_lost, ["task-failures"]),
+    # local-cluster's last number is the WORKER's memory; executors still default to spark.executor.memory=1g.
+    "executor_memory": ({"master": "local-cluster[2,1,4096]", "spark.executor.memory": "3g",
+                         "spark.executor.metrics.pollingInterval": "100ms",
+                         "spark.executor.processTreeMetrics.enabled": "true"}, executor_memory, ["executor-memory"]),
 }
 
 # The clean app again with each event-log codec (Spark 3.5 defaults to uncompressed; 4.0 to rolling + zstd).
@@ -145,6 +175,10 @@ CODEC_VARIANTS = {f"clean-{c}": c for c in ("zstd", "lz4", "snappy", "lzf")}
 
 def run_app(name: str, conf: dict, body, log_dir: str) -> dict:
     os.makedirs(log_dir, exist_ok=True)
+    if conf.get("master", "").startswith("local-cluster"):
+        import pyspark
+        os.environ.setdefault("SPARK_HOME", os.path.dirname(pyspark.__file__))   # executors are launched from here
+        os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
     conf = dict(conf)
     # Not SparkSession.builder: its options live in a CLASS-level dict, so every scenario's settings would leak
     # into all later ones. A fresh SparkConf per app (without JVM system-property defaults) is isolated.
@@ -179,7 +213,14 @@ def main() -> None:
         if name != "clean-defaults":
             conf = {"spark.eventLog.rolling.enabled": "false", **conf}
             conf.setdefault("spark.eventLog.compress", "false")
-        info = run_app(name, conf, body, log_dir)
+        try:
+            info = run_app(name, conf, body, log_dir)
+        except Exception as e:  # noqa: BLE001 - optional scenarios depend on the runner (local-cluster, /proc)
+            if name not in OPTIONAL:
+                raise
+            print(f"optional scenario {name} failed: {e!r}", flush=True)
+            shutil.rmtree(log_dir, ignore_errors=True)
+            continue
         info.update(expected=expected, conf=conf)
         manifest[name] = info
         print(json.dumps({name: info}), flush=True)

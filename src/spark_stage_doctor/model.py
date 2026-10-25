@@ -215,6 +215,7 @@ class Executor:
     added: int
     removed: int | None = None
     removed_reason: str | None = None
+    max_onheap: int = 0        # BlockManagerAdded: Spark's unified (execution + storage) on-heap region, in bytes
 
 
 @dataclass
@@ -229,6 +230,10 @@ class App:
     jobs: dict[int, Job] = field(default_factory=dict)
     stages: dict[tuple[int, int], Stage] = field(default_factory=dict)
     sql: dict[int, SqlExecution] = field(default_factory=dict)
+    executor_peaks: dict[str, dict[str, int]] = field(default_factory=dict)   # executor -> metric -> peak
+    profile_memory_mib: int | None = None          # default resource profile: executor heap (MiB)
+    profile_overhead_mib: int | None = None
+    pending_block_managers: dict[str, int] = field(default_factory=dict)   # block manager seen before its executor
     unknown_events: Counter = field(default_factory=Counter)
     notes: list[str] = field(default_factory=list)
 
@@ -354,8 +359,17 @@ def build(events: list[dict]) -> App:
                 if isinstance(ev.get("Spark Properties"), dict) else {str(k): str(v) for k, v in ev.get("Spark Properties") or []}
         elif name == "SparkListenerExecutorAdded":
             info = ev.get("Executor Info", {})
-            app.executors[str(ev.get("Executor ID"))] = Executor(str(ev.get("Executor ID")), info.get("Host", ""),
-                                                                 _int(info.get("Total Cores")), _int(ev.get("Timestamp")))
+            eid = str(ev.get("Executor ID"))
+            app.executors[eid] = Executor(eid, info.get("Host", ""), _int(info.get("Total Cores")), _int(ev.get("Timestamp")),
+                                          max_onheap=app.pending_block_managers.pop(eid, 0))
+        elif name == "SparkListenerBlockManagerAdded":
+            bm = ev.get("Block Manager ID") or {}
+            e = app.executors.get(str(bm.get("Executor ID")))
+            if e:
+                e.max_onheap = _int(ev.get("Maximum Onheap Memory"), _int(ev.get("Maximum Memory")))
+            else:
+                app.pending_block_managers[str(bm.get("Executor ID"))] = _int(ev.get("Maximum Onheap Memory"),
+                                                                               _int(ev.get("Maximum Memory")))
         elif name == "SparkListenerExecutorRemoved":
             e = app.executors.get(str(ev.get("Executor ID")))
             if e:
@@ -388,6 +402,12 @@ def build(events: list[dict]) -> App:
                 s.sql_acc_ids |= {_int(a.get("ID"), -1) for a in info.get("Accumulables") or [] if a.get("Metadata") == "sql"}
         elif name == "SparkListenerTaskEnd":
             t = _task(ev)
+            # Task-end snapshots of the executor's metrics: a second source of peaks (same zero caveat).
+            snap = ev.get("Task Executor Metrics") or {}
+            if any(_int(v) for v in snap.values()):
+                peaks = app.executor_peaks.setdefault(t.executor, {})
+                for k, v in snap.items():
+                    peaks[k] = max(peaks.get(k, 0), _int(v))
             s = app.stages.get(t.stage)
             if s is None:
                 s = app.stages[t.stage] = Stage(t.stage[0], t.stage[1], "", 0)
@@ -419,6 +439,17 @@ def build(events: list[dict]) -> App:
             ex = app.sql.get(_int(ev.get("executionId")))
             if ex:
                 ex.end, ex.error = _int(ev.get("time")), ev.get("errorMessage") or None
+        elif name == "SparkListenerStageExecutorMetrics":
+            # Per-stage peaks, logged only with spark.eventLog.logStageExecutorMetrics=true. All zero when no
+            # metrics poll happened during the stage (spark.executor.metrics.pollingInterval, default: heartbeat).
+            peaks = app.executor_peaks.setdefault(str(ev.get("Executor ID")), {})
+            for k, v in (ev.get("Executor Metrics") or {}).items():
+                peaks[k] = max(peaks.get(k, 0), _int(v))
+        elif name == "SparkListenerResourceProfileAdded" and _int(ev.get("Resource Profile Id")) == 0:
+            req = ev.get("Executor Resource Requests") or {}
+            app.profile_memory_mib = _int((req.get("memory") or {}).get("Amount"), None) if "memory" in req else None
+            if "memoryOverhead" in req:
+                app.profile_overhead_mib = _int(req["memoryOverhead"].get("Amount"), None)
         elif name in _IGNORED:
             pass
         else:
@@ -432,9 +463,9 @@ def build(events: list[dict]) -> App:
     return app
 
 
-_IGNORED = {"SparkListenerTaskStart", "SparkListenerTaskGettingResult", "SparkListenerBlockManagerAdded",
+_IGNORED = {"SparkListenerTaskStart", "SparkListenerTaskGettingResult",
             "SparkListenerBlockManagerRemoved", "SparkListenerUnpersistRDD", "SparkListenerExecutorMetricsUpdate",
-            "SparkListenerStageExecutorMetrics", "SparkListenerBlockUpdated", "SparkListenerResourceProfileAdded",
+            "SparkListenerBlockUpdated", "SparkListenerResourceProfileAdded",
             "SparkListenerSpeculativeTaskSubmitted", "SparkListenerExecutorExcluded", "SparkListenerExecutorUnexcluded",
             "SparkListenerNodeExcluded", "SparkListenerNodeUnexcluded", "SparkListenerExecutorBlacklisted",
             "SparkListenerExecutorUnblacklisted", "SparkListenerNodeBlacklisted", "SparkListenerNodeUnblacklisted",

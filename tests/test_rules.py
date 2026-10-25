@@ -3,7 +3,7 @@ import events as E
 import pytest
 
 from spark_stage_doctor import model, rules
-from spark_stage_doctor.rules import DEFAULT, parse_bytes, spark_size
+from spark_stage_doctor.rules import DEFAULT, memory_size, parse_bytes, spark_size
 
 MiB = 1 << 20
 
@@ -26,6 +26,10 @@ def tasks(stage_id, runs, **kw):
                                             ("64k", 64 << 10), ("1g", 1 << 30), ("-1", -1), ("junk", 7), (None, 7)])
 def test_parse_bytes(text, expected):
     assert parse_bytes(text, 7) == expected
+
+
+def test_memory_size_rounds_up():
+    assert (memory_size(1 << 30), memory_size(1.39e9), memory_size(1)) == ("1g", "1536m", "256m")
 
 
 def test_spark_size():
@@ -139,10 +143,14 @@ def test_fetch_failure_and_stage_retry():
     assert "stage FAILED" in fs[0].detail and "retry attempt 1" in fs[1].detail
 
 
-def test_speculation_waste():
-    evs = [E.task(0, 0, 40_000, reason="TaskKilled", speculative=True, **{"Kill Reason": "another attempt succeeded"}),
-           E.task(0, 0, 50_000, attempt=1)]
-    assert by_rule(diagnose(E.stage(0, 1), evs), "speculation-waste")
+def test_speculation_waste_counts_only_killed_copies():
+    lost = [E.task(0, 0, 50_000), E.task(0, 0, 40_000, attempt=1, reason="TaskKilled", speculative=True,
+                                         **{"Kill Reason": "another attempt succeeded"})]
+    won = [E.task(0, 0, 60_000, reason="TaskKilled", **{"Kill Reason": "another attempt succeeded"}),
+           E.task(0, 0, 5_000, attempt=1, speculative=True)]
+    a, b = diagnose(E.stage(0, 1), lost), diagnose(E.stage(0, 1), won)
+    assert by_rule(a, "speculation-waste") and not by_rule(a, "speculation-helped")
+    assert by_rule(b, "speculation-helped") and not by_rule(b, "speculation-waste")
 
 
 def test_small_tasks_advice_depends_on_the_source():
@@ -231,3 +239,37 @@ def test_the_first_successful_attempt_is_kept_when_a_speculative_copy_also_succe
     s = model.build(E.app(E.stage(0, 1), late_copy, first)).stages[(0, 0)]
     [kept] = s.successful
     assert not kept.speculative
+
+
+def _metrics_app(heap_used, exec_mem, storage_mem, rss=0, gc_ms=0, master="yarn", memory="4g", region=2 << 30):
+    evs = [{"Event": "SparkListenerBlockManagerAdded", "Block Manager ID": {"Executor ID": "1", "Host": "h1", "Port": 1},
+            "Maximum Memory": region, "Timestamp": E.T0, "Maximum Onheap Memory": region, "Maximum Offheap Memory": 0},
+           *E.stage(0, 4), *tasks(0, [200_000] * 4, gc_ms=gc_ms),
+           {"Event": "SparkListenerStageExecutorMetrics", "Executor ID": "1", "Stage ID": 0, "Stage Attempt ID": 0,
+            "Executor Metrics": {"JVMHeapMemory": heap_used, "OnHeapExecutionMemory": exec_mem,
+                                 "OnHeapStorageMemory": storage_mem, "ProcessTreeJVMRSSMemory": rss}}]
+    return evs, {"spark.master": master, "spark.executor.memory": memory}
+
+
+def test_executor_memory_full_heap_with_gc():
+    evs, props = _metrics_app(int(3.8 * (1 << 30)), 1 << 30, 1 << 29, gc_ms=40_000)
+    [f] = by_rule(diagnose(evs, props=props), "executor-memory")
+    assert f.severity == "warn" and "short of memory" in f.detail
+
+
+def test_executor_memory_over_provisioned_needs_both_signals():
+    evs, props = _metrics_app(1 << 29, 1 << 27, 1 << 27)                 # 12% heap, 12.5% managed
+    assert by_rule(diagnose(evs, props=props), "executor-memory")[0].severity == "info"
+    evs, props = _metrics_app(1 << 29, 1 << 30, 1 << 29)                 # Spark's own memory 75% used
+    assert not by_rule(diagnose(evs, props=props), "executor-memory")
+
+
+def test_container_memory_from_process_rss():
+    evs, props = _metrics_app(2 << 30, 1 << 30, 0, rss=int(4.3 * (1 << 30)))   # 4g heap + 409.6m overhead
+    [f] = by_rule(diagnose(evs, props=props), "container-memory")
+    assert "exit code 137" in f.detail and f.evidence["container_bytes"] == (4 << 30) + (4 << 30) // 10
+
+
+def test_executor_metrics_all_zero_are_ignored():
+    evs, props = _metrics_app(0, 0, 0)
+    assert not by_rule(diagnose(evs, props=props), "executor-memory")

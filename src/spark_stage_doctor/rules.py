@@ -31,12 +31,13 @@ class Thresholds:
     shuffle_heavy_min_bytes: int = GiB
     utilisation_min_app_ms: int = 5 * 60_000
     small_files_min_count: int = 100
+    memory_min_task_ms: int = 10 * 60_000     # total task time before memory sizing is worth judging
 
 
 DEFAULT = Thresholds()
 DEV = Thresholds(min_tasks=5, skew_min_max_task_ms=1000, data_skew_min_bytes=MiB, small_tasks_min_count=200,
                  few_tasks_min_wall_ms=1000, gc_min_run_ms=2000, shuffle_heavy_min_bytes=16 * MiB,
-                 utilisation_min_app_ms=5000, small_files_min_count=50)
+                 utilisation_min_app_ms=5000, small_files_min_count=50, memory_min_task_ms=2000)
 PROFILES = {"default": DEFAULT, "dev": DEV}
 
 
@@ -81,6 +82,13 @@ def spark_size(n: float) -> str:
         if n >= 1 << shift:
             return f"{int(n) >> shift}{unit}"
     return str(int(n))
+
+
+def memory_size(n: float) -> str:
+    """A memory setting to suggest: rounded UP to 256 MiB, so a suggestion never undercuts what was measured."""
+    q = 256 * MiB
+    n = -(-int(n) // q) * q
+    return f"{n >> 30}g" if n % (1 << 30) == 0 else f"{n >> 20}m"
 
 
 def _bool(v: str | None, default: bool) -> bool:
@@ -386,8 +394,10 @@ def error_line(text: str | None) -> str:
     return pick[:200]
 
 
-_OOM = re.compile(r"OutOfMemory|exceeding memory limits|Container killed|exit code 137|killed by YARN|memoryOverhead",
-                  re.I)
+# "Command exited with code 137" is what a SIGKILLed executor reports (seen on a real log): the usual sender is the
+# OS / YARN / Kubernetes OOM killer.
+_OOM = re.compile(r"OutOfMemory|exceeding memory limits|Container killed|exit(ed)? (with )?code 137|killed by YARN|"
+                  r"memoryOverhead|OOMKilled", re.I)
 
 
 def failures(app: App, s: Stage, th: Thresholds) -> list[Finding]:
@@ -397,7 +407,8 @@ def failures(app: App, s: Stage, th: Thresholds) -> list[Finding]:
     if failed or s.failure or s.attempt > 0:
         total = max(s.num_tasks, 1)
         rate = len(failed) / total
-        severity = ("critical" if s.failure or rate >= 0.5 else "warn" if rate >= 0.3 or s.attempt > 0
+        lost = [t for t in failed if t.reason == "ExecutorLostFailure"]
+        severity = ("critical" if s.failure or rate >= 0.5 else "warn" if rate >= 0.3 or s.attempt > 0 or lost
                     or any(t.reason == "FetchFailed" for t in failed) else "info")
         groups = Counter((t.reason, t.error_class or "") for t in failed)
         sample = {k: next(t.error for t in failed if (t.reason, t.error_class or "") == k) for k in groups}
@@ -406,6 +417,11 @@ def failures(app: App, s: Stage, th: Thresholds) -> list[Finding]:
         if any(_OOM.search(f"{t.error_class} {t.error}") for t in failed):
             fixes.append("Out-of-memory failures: raise spark.executor.memoryOverhead (to ~20% of executor memory; "
                          "spark.executor.pyspark.memory for Python workers), and make partitions smaller (see spill).")
+        if lost:
+            fixes.append(f"{len(lost)} attempt(s) died with their executor (lost executors: "
+                         f"{', '.join(sorted({t.executor for t in lost}))}). Exit code 137 means the process was "
+                         "SIGKILLed, usually by the OOM killer or the container limit; check the cluster manager's "
+                         "logs for that executor. Every task on it, and its shuffle output, had to be redone.")
         if any(t.reason == "FetchFailed" for t in failed) or s.attempt > 0:
             fixes.append("Shuffle fetch failures re-run parent stages: usually a lost executor (memory, preemption). "
                          "Check the executor-loss reasons; an external shuffle service keeps shuffle files alive.")
@@ -422,16 +438,28 @@ def failures(app: App, s: Stage, th: Thresholds) -> list[Finding]:
                                       "errors": dict(Counter(f"{r} {c}".strip() for r, c in groups.elements())),
                                       "stage_failed": bool(s.failure)},
                             source="Dr. Elephant (task failure rate 0.1 / 0.3 / 0.5)"))
+    # "another attempt succeeded" kills the LOSER. A killed speculative copy is pure waste; a killed original means
+    # the copy won, i.e. speculation rescued a straggler.
     run = sum(t.run_ms for t in s.tasks)
-    wasted = sum(t.run_ms for t in killed)
-    if killed and ratio(wasted, run) >= 0.05:
+    lost_copies = [t for t in killed if t.speculative]
+    won = [t for t in killed if not t.speculative]
+    wasted = sum(t.run_ms for t in lost_copies)
+    if lost_copies and ratio(wasted, run) >= 0.05:
         out.append(_finding(app, s, rule="speculation-waste", severity="warn",
                             title=f"Speculation wasted {ratio(wasted, run):.0%} of task time",
-                            detail=f"{len(killed)} speculative or original attempts were killed because another "
-                                   f"attempt finished first, after running {human_ms(wasted)}.",
-                            fixes=["Raise spark.speculation.multiplier / spark.speculation.quantile, or disable "
-                                   "speculation for this job if the slow tasks are data skew (copies read the same data)."],
-                            evidence={"killed_attempts": len(killed), "wasted_run_ms": wasted, "run_ms": run}))
+                            detail=f"{len(lost_copies)} speculative copies ran {human_ms(wasted)} and were killed because "
+                                   "the original attempt finished first: the originals were not stragglers.",
+                            fixes=["Make speculation pickier: raise spark.speculation.multiplier / spark.speculation.quantile "
+                                   "(or spark.speculation.minTaskRuntime); disable it for this job if slow tasks are data "
+                                   "skew, since a copy reads the same data."],
+                            evidence={"killed_copies": len(lost_copies), "wasted_run_ms": wasted, "run_ms": run}))
+    if won:
+        out.append(_finding(app, s, rule="speculation-helped", severity="info",
+                            title=f"Speculation rescued {len(won)} straggling task{'s' if len(won) > 1 else ''}",
+                            detail=f"For {len(won)} partition{'s' if len(won) > 1 else ''} a speculative copy finished first "
+                                   f"and the original was killed after {human_ms(sum(t.run_ms for t in won))}. Look at the "
+                                   f"hosts of the originals ({', '.join(sorted({t.host for t in won}))}) for slow nodes.",
+                            evidence={"rescued": len(won), "original_run_ms": sum(t.run_ms for t in won)}))
     return out
 
 
@@ -576,6 +604,64 @@ def small_files(app: App, th: Thresholds) -> list[Finding]:
     return out
 
 
+def executor_memory(app: App, th: Thresholds) -> list[Finding]:
+    """Executor heap and container sizing from recorded peaks (needs spark.eventLog.logStageExecutorMetrics=true and
+    a metrics poll during the stages; otherwise there is nothing to judge and the rule stays silent)."""
+    local = (app.properties.get("spark.master") or "").startswith("local[") or app.properties.get("spark.master") == "local"
+    peaks = {e: p for e, p in app.executor_peaks.items() if (e == "driver") == local and p.get("JVMHeapMemory", 0) > 0}
+    task_ms = sum(t.run_ms for s in app.stages.values() for t in s.tasks)
+    if not peaks or task_ms < th.memory_min_task_ms:
+        return []
+    if local:
+        heap = parse_bytes(app.properties.get("spark.driver.memory"), 1 << 30)
+    elif app.profile_memory_mib:
+        heap = app.profile_memory_mib * MiB
+    else:
+        heap = parse_bytes(app.properties.get("spark.executor.memory"), 1 << 30)
+    overhead = (app.profile_overhead_mib * MiB if app.profile_overhead_mib else
+                parse_bytes(app.properties.get("spark.executor.memoryOverhead"), max(384 * MiB, heap // 10)))
+    peak_heap = max(p["JVMHeapMemory"] for p in peaks.values())
+    rss = max(p.get("ProcessTreeJVMRSSMemory", 0) + p.get("ProcessTreePythonRSSMemory", 0)
+              + p.get("ProcessTreeOtherRSSMemory", 0) for p in peaks.values())
+    gc = ratio(sum(t.gc_ms for s in app.stages.values() for t in s.tasks), task_ms)
+    use = peak_heap / heap
+    # Spark's managed memory (execution + storage) against its unified region: what Spark itself needed. Used heap
+    # alone mostly measures uncollected garbage, which grows with whatever heap is available.
+    unified = {e: (p.get("OnHeapExecutionMemory", 0) + p.get("OnHeapStorageMemory", 0)) for e, p in peaks.items()}
+    regions = {e: app.executors[e].max_onheap for e in peaks if e in app.executors and app.executors[e].max_onheap}
+    managed_use = max((unified[e] / regions[e] for e in regions), default=None)
+    ev = {"executors": len(peaks), "heap_bytes": heap, "peak_heap_bytes": peak_heap, "heap_use": round(use, 3),
+          "peak_managed_use": round(managed_use, 3) if managed_use is not None else None,
+          "peak_rss_bytes": rss, "container_bytes": heap + overhead, "gc_share": round(gc, 3)}
+    where = "application" + (" (local mode: the driver is the executor)" if local else "")
+    out = []
+    if rss and rss >= 0.9 * (heap + overhead):
+        out.append(Finding("container-memory", "warn", f"Executor processes reached {rss / (heap + overhead):.0%} of the "
+                           "container", f"Peak resident memory of an executor process tree was {human_bytes(rss)} against "
+                           f"{human_bytes(heap + overhead)} (heap {human_bytes(heap)} + overhead {human_bytes(overhead)}). "
+                           "Past the limit, YARN / Kubernetes kill the container (exit code 137) and its tasks are lost.",
+                           ["Raise spark.executor.memoryOverhead (off-heap buffers, Python workers, native libraries), "
+                            "or spark.executor.pyspark.memory for Python-heavy jobs."], ev, where=where))
+    if use >= 0.9 and gc >= 0.10:
+        out.append(Finding("executor-memory", "warn", f"Executor heap peaked at {use:.0%} with {gc:.0%} GC",
+                           f"Used heap reached {human_bytes(peak_heap)} of {human_bytes(heap)} while tasks spent {gc:.0%} "
+                           "of their time in GC: the executors are short of memory.",
+                           ["Raise spark.executor.memory, or lower spark.executor.cores so each task gets more memory.",
+                            "Make partitions smaller (more shuffle partitions) so less data is held per task."],
+                           ev, "Spark UI (GC red at 10%); project", where=where))
+    elif (managed_use is not None and managed_use < 0.3 and use < 0.5
+          and heap - max(1 << 30, int(peak_heap * 1.5)) >= 1 << 30):        # worth it only if it frees >= 1 GiB
+        suggested = max(1 << 30, int(peak_heap * 1.5))
+        out.append(Finding("executor-memory", "info",
+                           f"Executors used {managed_use:.0%} of Spark's memory: likely over-provisioned",
+                           f"Spark's execution + storage memory peaked at {managed_use:.0%} of its unified region, and "
+                           f"used heap (including uncollected garbage) at {human_bytes(peak_heap)} of {human_bytes(heap)}, "
+                           f"on {len(peaks)} executor(s). Peaks are sampled, so treat this as a size to test, not a guarantee.",
+                           [f"Try spark.executor.memory={memory_size(suggested)}, or more cores per executor with the same "
+                            "memory; re-check after the change."], ev, "project", where=where))
+    return out
+
+
 def utilisation(app: App, th: Thresholds) -> list[Finding]:
     spans = sorted((j.submitted, j.completed) for j in app.jobs.values() if j.completed)
     if not spans or not app.total_cores:
@@ -611,6 +697,7 @@ def diagnose(app: App, th: Thresholds = DEFAULT) -> list[Finding]:
             out += rule(app, s, th)
     out += broadcast_candidates(app, th)
     out += small_files(app, th)
+    out += executor_memory(app, th)
     out += utilisation(app, th)
     order = {k: i for i, k in enumerate(reversed(SEVERITIES))}
     return sorted(out, key=lambda f: (order[f.severity], f.stage or (1 << 30, 0), f.rule))

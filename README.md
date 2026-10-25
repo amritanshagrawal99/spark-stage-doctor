@@ -67,8 +67,10 @@ Logs still being written are fine: a cut-off last line or compressed block is dr
 | `too-few-tasks` | fewer tasks than cores on a long stage; points at `coalesce()` when it's in the lineage; skips small shuffles AQE coalesced on purpose | Databricks (one-task stage); tuning guide (2-3 tasks/core) |
 | `gc-pressure` | GC >= 10% of task time | Spark UI (red at 10%); Dr. Elephant |
 | `scheduler-delay` | median scheduler delay >= 100 ms, or a slow stage start | project |
-| `task-failures` | failed attempts, grouped by error (the real exception line, also inside Python tracebacks); OOM / container-kill and fetch-failure advice; stage retries | Dr. Elephant (failure rate) |
-| `speculation-waste` | killed speculative attempts burned >= 5% of task time | project |
+| `task-failures` | failed attempts, grouped by error (the real exception line, also inside Python tracebacks); lost executors (exit 137 = SIGKILL, usually the OOM killer), OOM and fetch-failure advice; stage retries | Dr. Elephant (failure rate) |
+| `speculation-waste` / `speculation-helped` | a killed speculative COPY is waste (the original wasn't a straggler; >= 5% of task time warns); a killed ORIGINAL means the copy rescued a straggler (info, with its host) | project |
+| `executor-memory` | Spark's managed memory (execution + storage) and used heap from executor peaks: heap >= 90% with >= 10% GC is short of memory; managed memory < 30% and heap < 50% on executors that could shed >= 1 GiB is over-provisioned (suggestion rounded up) | Spark UI (GC); project |
+| `container-memory` | an executor's process-tree RSS reached 90% of heap + overhead, the point where YARN / Kubernetes kill it (exit 137) | project |
 | `shuffle-heavy` | >= 1 GiB shuffled with a high write / fetch-wait share | project |
 | `low-utilisation` | tasks used < 50% of the cores while jobs ran | project |
 
@@ -117,7 +119,8 @@ These details decide whether the numbers are right. Each was checked against Spa
 `tools/gen_fixtures.py` runs on GitHub Actions with **pyspark 3.5.9 and 4.0.4**
 ([fixtures workflow](.github/workflows/fixtures.yml)). It writes one application per scenario: clean, plain-shuffle
 skew, a skewed join AQE doesn't split, one it does split, broadcast disabled, forced spill, 1000 tiny tasks, a
-`coalesce(1)` stage, injected task failures, 120 tiny CSV files, and the clean app under every event-log codec and Spark's default
+`coalesce(1)` stage, injected task failures, 120 tiny CSV files, and, on `local-cluster` with two real executor
+JVMs, a task that SIGKILLs its own executor and a cached workload with 100 ms executor-metric polling, and the clean app under every event-log codec and Spark's default
 layout. The logs are committed, so the tests need no JVM.
 
 - **Every scenario must produce exactly its intended findings, and the clean baseline none,** on both Spark versions.
@@ -127,20 +130,29 @@ layout. The logs are committed, so the tests need no JVM.
   GC, Photon plan names, Databricks thresholds.
 - Key branches were mutation-tested: each surviving mutant got a test.
 
-Two things the real logs caught that the docs didn't:
+What the real logs caught that the docs and the synthetic tests didn't:
 
-- PySpark's `SparkSession.builder` keeps its options in a class-level dict, so generating several apps in one
-  process silently leaked each scenario's settings into the next. A test now checks each log's properties against
-  its manifest.
-- The fixture workflow confirmed that Spark 4.0's default log is a rolling directory with zstd.
+- **Leaking settings.** PySpark's `SparkSession.builder` keeps its options in a class-level dict, so generating
+  several apps in one process silently leaked each scenario's settings into the next. A test now checks each log's
+  properties against its manifest.
+- **The lost-executor message.** A SIGKILLed executor reports "Command exited with code 137". The first
+  out-of-memory pattern looked for "exit code 137" and missed it.
+- **local-cluster memory.** In `local-cluster[N,cores,MB]` the MB is the worker's memory. Executors still get
+  `spark.executor.memory` (1g).
+- **Used heap is a poor sizing signal.** On 3 GiB executors, used heap peaked at 13% on Spark 3.5 but 32% on 4.0 for
+  the same job, mostly uncollected garbage. Spark's managed memory was 16% on both, so sizing uses that.
+- **Spark 4.0's default log** is a rolling directory with zstd (confirmed).
 
 ## Limitations
 
 - **Databricks is experimental.** The folder layout and Photon operator names (`PhotonGroupingAgg`, ...) come from
   documentation and community reports. No real Databricks log is in the test suite yet, and contributions of a
   redacted one are welcome.
-- Some executor-level metrics need `spark.eventLog.logStageExecutorMetrics=true` (off by default), and none of the
-  rules depend on them. GC pressure uses task-level GC time, which is JVM-wide, so it is reported as a ratio.
+- Executor memory rules need `spark.eventLog.logStageExecutorMetrics=true` (off by default). They also need a
+  metrics poll during the stages: `spark.executor.metrics.pollingInterval` defaults to the 10 s heartbeat, so short
+  stages record zeros, and the rules then stay silent. Process RSS needs
+  `spark.executor.processTreeMetrics.enabled=true`. GC pressure uses task-level GC time, which is JVM-wide, so it is
+  reported as a ratio.
 - Skew is measured per task. When AQE coalesces a skewed stage down to a handful of tasks, there is too little
   distribution to call it skew (fewer than 10 successful tasks, or 5 with `--profile dev`).
 - Structured streaming queries are parsed, but there are no streaming-specific rules yet.
