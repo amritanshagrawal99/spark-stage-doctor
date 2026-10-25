@@ -229,6 +229,49 @@
     "seconds": 2.0,
     "spark_version": "4.0.4"
   },
+  "stream_falling_behind": {
+    "app_id": "local-1792909125369",
+    "conf": {
+      "spark.eventLog.compress": "false",
+      "spark.eventLog.rolling.enabled": "false"
+    },
+    "expected": [
+      "stream-falling-behind"
+    ],
+    "files": [
+      "local-1792909125369"
+    ],
+    "seconds": 40.5,
+    "spark_version": "4.0.4"
+  },
+  "stream_healthy": {
+    "app_id": "local-1792909096261",
+    "conf": {
+      "spark.eventLog.compress": "false",
+      "spark.eventLog.rolling.enabled": "false"
+    },
+    "expected": [],
+    "files": [
+      "local-1792909096261"
+    ],
+    "seconds": 14.5,
+    "spark_version": "4.0.4"
+  },
+  "stream_unbounded_state": {
+    "app_id": "local-1792909110814",
+    "conf": {
+      "spark.eventLog.compress": "false",
+      "spark.eventLog.rolling.enabled": "false"
+    },
+    "expected": [
+      "stream-state-growth"
+    ],
+    "files": [
+      "local-1792909110814"
+    ],
+    "seconds": 14.5,
+    "spark_version": "4.0.4"
+  },
   "task_failures": {
     "app_id": "local-1792906475202",
     "conf": {
