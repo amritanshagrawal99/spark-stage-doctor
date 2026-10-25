@@ -19,7 +19,7 @@ import shutil
 import sys
 import time
 
-from pyspark import TaskContext
+from pyspark import SparkConf, SparkContext, TaskContext
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
@@ -129,11 +129,12 @@ CODEC_VARIANTS = {f"clean-{c}": c for c in ("zstd", "lz4", "snappy", "lzf")}
 def run_app(name: str, conf: dict, body, log_dir: str) -> dict:
     os.makedirs(log_dir, exist_ok=True)
     conf = dict(conf)
-    b = SparkSession.builder.master(conf.pop("master", "local[2]")).appName(name)
-    for k, v in {**BASE_CONF, **conf, "spark.eventLog.dir": "file://" + log_dir}.items():
-        b = b.config(k, v)
-    spark = b.getOrCreate()
-    sc = spark.sparkContext
+    # Not SparkSession.builder: its options live in a CLASS-level dict, so every scenario's settings would leak
+    # into all later ones. A fresh SparkConf per app (without JVM system-property defaults) is isolated.
+    sconf = SparkConf(loadDefaults=False).setMaster(conf.pop("master", "local[2]")).setAppName(name)
+    sconf.setAll(list({**BASE_CONF, **conf, "spark.eventLog.dir": "file://" + log_dir}.items()))
+    sc = SparkContext(conf=sconf)
+    spark = SparkSession(sc)
     app_id, version = sc.applicationId, spark.version
     sc.setJobDescription(name)
     t = time.time()
@@ -141,6 +142,7 @@ def run_app(name: str, conf: dict, body, log_dir: str) -> dict:
         body(spark)
     finally:
         spark.stop()
+        SparkSession._instantiatedSession = None   # noqa: SLF001 - so the next app does not reuse this session
     files = sorted(os.listdir(log_dir))
     return {"app_id": app_id, "spark_version": version, "seconds": round(time.time() - t, 1), "files": files}
 
