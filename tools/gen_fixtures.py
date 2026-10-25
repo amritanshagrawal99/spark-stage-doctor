@@ -106,6 +106,19 @@ def task_failures(spark):
     spark.sparkContext.parallelize(range(80_000), 8).mapPartitionsWithIndex(flaky).collect()
 
 
+def small_files(spark):
+    """120 CSV files of ~2 KiB each, written by plain Python so that only the scan is in the log."""
+    d = os.path.join(OUT, "_data", "small_csv")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    for i in range(120):
+        with open(os.path.join(d, f"part-{i:04d}.csv"), "w") as f:
+            f.writelines(f"{i * 100 + j},{j % 7},row-{i}-{j}
+" for j in range(100))
+    df = spark.read.schema("id LONG, grp INT, payload STRING").csv("file://" + d)
+    noop(df.groupBy("grp").count())
+
+
 SCENARIOS = {
     "clean": ({}, clean, []),
     "skew_repartition": ({}, skew_repartition, ["task-skew"]),
@@ -124,6 +137,7 @@ SCENARIOS = {
     "single_task": ({}, single_task, ["too-few-tasks"]),
     # local[N] ignores spark.task.maxFailures (always 1); local[N,F] allows F attempts per task.
     "task_failures": ({"master": "local[2,2]"}, task_failures, ["task-failures"]),
+    "small_files": ({}, small_files, ["small-files"]),
 }
 
 # The clean app again with each event-log codec (Spark 3.5 defaults to uncompressed; 4.0 to rolling + zstd).
@@ -170,6 +184,7 @@ def main() -> None:
         info.update(expected=expected, conf=conf)
         manifest[name] = info
         print(json.dumps({name: info}), flush=True)
+    shutil.rmtree(os.path.join(OUT, "_data"), ignore_errors=True)
     with open(os.path.join(OUT, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2, sort_keys=True)
     print("sizes:", {p: os.path.getsize(p) for p in glob.glob(os.path.join(OUT, "*", "*")) if os.path.isfile(p)})
