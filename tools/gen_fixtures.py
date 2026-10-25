@@ -113,8 +113,7 @@ def small_files(spark):
     os.makedirs(d)
     for i in range(120):
         with open(os.path.join(d, f"part-{i:04d}.csv"), "w") as f:
-            f.writelines(f"{i * 100 + j},{j % 7},row-{i}-{j}
-" for j in range(100))
+            f.writelines(f"{i * 100 + j},{j % 7},row-{i}-{j}\n" for j in range(100))
     df = spark.read.schema("id LONG, grp INT, payload STRING").csv("file://" + d)
     noop(df.groupBy("grp").count())
 
